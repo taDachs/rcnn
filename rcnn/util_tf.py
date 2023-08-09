@@ -154,7 +154,8 @@ def visualize_labels(
             if show_offsets:
                 drawn_bboxes = tf.image.draw_bounding_boxes(drawn_bboxes, box[None, None], (color,))
     else:
-        for i, idx in enumerate(tf.where(pred_mask)[0]):
+        for i, idx in enumerate(tf.where(pred_mask)):
+            idx = idx[0]
             color = interpolated[anc_mapping[idx]] if anc_mapping is not None else interpolated[i]
             if show_offsets:
                 drawn_bboxes = tf.image.draw_bounding_boxes(
