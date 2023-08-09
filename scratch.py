@@ -6,6 +6,8 @@ import random
 from typing import Tuple
 
 import matplotlib.pyplot as plt  # type: ignore
+import matplotlib
+matplotlib.use('GTK3Agg')  # Or any other X11 back-end
 import tensorflow as tf  # type: ignore
 import tensorflow_datasets as tfds
 
@@ -22,31 +24,31 @@ from rcnn.data_tf import (
 from rcnn.util_tf import ccwh_to_xyxy, visualize_labels
 
 # ---
-IMG_SHAPE = (256, 256, 3)
-square_size = 16
+IMG_SHAPE = (512, 512, 3)
+square_size = 32
 grid_size = (32, 32)
-anc_size = 3
+anc_size = 6
 anc_ratios = (0.5, 1.0, 2.0)
 anc_scales = (1, 2, 3)
 num_ancs = len(anc_ratios) * len(anc_scales)
 
 
 # ---
-img = tf.zeros(IMG_SHAPE)
+# img = tf.zeros(IMG_SHAPE)
 # squares, bboxes = generate_squares(50, square_size, img)
-img, bboxes = generate_mnist(50, square_size, img)
+# img, bboxes = generate_mnist(50, square_size, img)
 ancs = generate_anchor_boxes(grid_size, anc_size, anc_ratios, anc_scales)
 
-# (ds_train, ds_test), ds_info = tfds.load(
-#     "voc/2007",
-#     split=["train", "test"],
-#     shuffle_files=True,
-#     with_info=True,
-# )
-#
-# x = next(ds_train.as_numpy_iterator())
-# img = x["image"] / 255.0
-# bboxes = x["objects"]["bbox"]
+(ds_train, ds_test), ds_info = tfds.load(
+    "voc/2007",
+    split=["train", "test"],
+    shuffle_files=True,
+    with_info=True,
+)
+
+x = next(ds_train.as_numpy_iterator())
+img = x["image"] / 255.0
+bboxes = x["objects"]["bbox"]
 
 anc_mapping, offsets, pos_mask, neg_mask = label_img(bboxes, grid_size, ancs)
 
@@ -70,11 +72,7 @@ plt.show()
 
 # ---
 input_shape = IMG_SHAPE
-learning_rate = 1e-3
-
-# ---
-
-
+learning_rate = 1e-4
 # ---
 
 
@@ -82,17 +80,19 @@ class RPN(tf.keras.Model):
     def __init__(self, input_shape):
         super().__init__()
         inputs = tf.keras.Input(input_shape)
-        x = inputs
-        x = tf.keras.layers.Conv2D(16, 3, strides=1, padding="same")(x)
-        x = tf.keras.layers.MaxPooling2D(2)(x)
-        x = tf.keras.layers.ReLU()(x)
-        x = tf.keras.layers.Conv2D(32, 3, strides=1, padding="same")(x)
-        x = tf.keras.layers.MaxPooling2D(2)(x)
-        x = tf.keras.layers.ReLU()(x)
-        x = tf.keras.layers.Conv2D(64, 3, strides=1, padding="same")(x)
-        x = tf.keras.layers.MaxPooling2D(2)(x)
-        x = tf.keras.layers.ReLU()(x)
-        feat = x
+        backbone = tf.keras.applications.MobileNetV2(input_tensor=inputs, include_top=False)
+        # x = inputs
+        # x = tf.keras.layers.Conv2D(16, 3, strides=1, padding="same")(x)
+        # x = tf.keras.layers.MaxPooling2D(2)(x)
+        # x = tf.keras.layers.ReLU()(x)
+        # x = tf.keras.layers.Conv2D(32, 3, strides=1, padding="same")(x)
+        # x = tf.keras.layers.MaxPooling2D(2)(x)
+        # x = tf.keras.layers.ReLU()(x)
+        # x = tf.keras.layers.Conv2D(64, 3, strides=1, padding="same")(x)
+        # x = tf.keras.layers.MaxPooling2D(2)(x)
+        # x = tf.keras.layers.ReLU()(x)
+        feat = backbone.get_layer("block_13_expand_relu").output
+        feat = tf.keras.layers.Conv2D(64, 1, padding="same", activation="relu")(feat)
         cls_out = tf.keras.layers.Conv2D(num_ancs, 1, padding="same")(feat)
         cls_out = tf.keras.layers.Flatten()(cls_out)
 
@@ -141,27 +141,27 @@ class RPN(tf.keras.Model):
 
 # ---
 model = RPN(input_shape)
-
-
-# ---
-
 optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
 model.compile(optimizer)
+model(tf.zeros((1, *IMG_SHAPE)))
+model.summary(expand_nested=True)
 
 # ---
 ancs = generate_anchor_boxes(grid_size, anc_size, anc_ratios, anc_scales)
 
-steps = 500
-batch_size = 32
+steps = 1000
+batch_size = 64
 
-canvas = tf.zeros(IMG_SHAPE)
-ds_train = gen_to_dataset(
-    lambda: mnist_generator(15, square_size, canvas, grid_size, ancs, batch_size), n=steps
-)
-# ds_train = pascal_voc(IMG_SHAPE, grid_size, ancs, batch_size)
-epochs = 1
+# canvas = tf.zeros(IMG_SHAPE)
+# ds_train = gen_to_dataset(
+#     lambda: mnist_generator(15, square_size, canvas, grid_size, ancs, batch_size), n=steps
+# )
+ds_train = pascal_voc(IMG_SHAPE, grid_size, ancs, batch_size)
+epochs = 32
 
-model.fit(ds_train, epochs=epochs)
+model.fit(ds_train, epochs=epochs, callbacks=[
+    tf.keras.callbacks.LearningRateScheduler(lambda epoch, lr: lr if epoch != 32 else lr * 0.1)
+])
 
 # for epoch in range(epochs):
 #     print(f"### EPOCH {epoch} ###")
@@ -203,17 +203,17 @@ model.fit(ds_train, epochs=epochs)
 # print("########### TRAINING FINISHED ###########")
 #
 # # ---
-img = tf.zeros(IMG_SHAPE)
-img, bboxes = generate_mnist(10, square_size, img)
-# (ds_train, ds_test), ds_info = tfds.load(
-#     "voc/2007",
-#     split=["train", "test"],
-#     shuffle_files=True,
-#     with_info=True,
-# )
+# img = tf.zeros(IMG_SHAPE)
+# img, bboxes = generate_mnist(10, square_size, img)
+(ds_train, ds_test), ds_info = tfds.load(
+    "voc/2007",
+    split=["train", "test"],
+    shuffle_files=True,
+    with_info=True,
+)
 
-# x = next(ds_test.as_numpy_iterator())
-# img = tf.image.resize(x["image"] / 255.0, IMG_SHAPE[:2])
+x = next(ds_test.as_numpy_iterator())
+img = tf.image.resize(x["image"] / 255.0, IMG_SHAPE[:2])
 
 cls_pred, reg_pred = model(img[None, ...])
 cls_pred = tf.sigmoid(cls_pred)[0].numpy()
