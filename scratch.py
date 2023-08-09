@@ -1,296 +1,195 @@
 #!/usr/bin/env python3
 
 # ---
-from typing import List, Tuple, Sequence
+import math
+import random
+from typing import Tuple
 
-import tensorflow as tf
 import matplotlib.pyplot as plt  # type: ignore
 import numpy as np
+import tensorflow as tf  # type: ignore
+import tensorflow_datasets as tfds
 
-
-# ---
-IMG_SHAPE = (64, 64, 3)
-
-
-# ---
-def generate_squares(n: int, size: int, img: np.ndarray):
-    img = np.copy(img)
-    img_w, img_h, _ = img.shape
-
-    x = np.random.randint(0, img_w, size=n)
-    y = np.random.randint(0, img_h, size=n)
-    poses = np.stack((x, y), axis=-1)
-    sizes = np.full((n, 2), size)
-
-    squares = np.concatenate((poses, sizes), axis=-1)
-
-    for x, y, w, h in squares:
-        img[x : x + w, y : y + h] = (1.0, 0, 0)
-
-    bboxes = np.concatenate((poses, poses + sizes), axis=-1) / (img_w, img_h, img_w, img_h)
-
-    return img, bboxes
-
-
-# ---
-img = np.zeros(IMG_SHAPE)
-squares, bboxes = generate_squares(10, 9, img)
-
-
-# ---
-def generate_anchor_boxes(
-    grid_size: Tuple[int, int],
-    base_size: int = 1,
-    aspect_ratios=(0.5, 1.0, 2.0),
-    sclaes=(1, 2, 3),
-) -> np.ndarray:
-    """
-    Generate anchor boxes for object detection with R-CNN for each cell in a grid.
-
-    Args:
-        grid_size (tuple): Number of cells in the grid (rows, columns).
-        base_size (int): The base size of the anchor box (usually the smaller dimension).
-        aspect_ratios (list): List of aspect ratios for generating different box shapes.
-        scales (list): List of scales to multiply the base size by.
-
-    Returns:
-        anchor_boxes (list): List of anchor boxes in the format (x_center, y_center, width, height).
-    """
-    anchor_boxes = []
-    for y in range(grid_size[0]):
-        for x in range(grid_size[1]):
-            for scale in scales:
-                for ratio in aspect_ratios:
-                    width = base_size * scale / grid_size[0]
-                    height = base_size * scale * ratio / grid_size[1]
-                    x_center = (x + 0.5) / grid_size[0]
-                    y_center = (y + 0.5) / grid_size[1]
-
-                    anchor_boxes.append((x_center, y_center, width, height))
-
-    return np.array(anchor_boxes)
-
-
-# ---
-def xyxy_to_ccwh(bboxes):
-    x1, y1, x2, y2 = bboxes.T
-
-    w = x2 - x1
-    h = y2 - y1
-    cx = x1 + w / 2
-    cy = y1 + h / 2
-
-    return np.stack((cx, cy, w, h), axis=-1)
-
-
-def ccwh_to_xyxy(bboxes):
-    x, y, w, h = bboxes.T
-    x1 = x - w / 2
-    y1 = y - h / 2
-    x2 = x + w / 2
-    y2 = y + h / 2
-
-    return np.stack((x1, y1, x2, y2), axis=-1)
-
-
-def rel_to_grid(bboxes, grid_size):
-    w, h = grid_size
-    bboxes = bboxes * (w, h, w, h)
-    return bboxes
-
-
-def grid_to_rel(bboxes, grid_size):
-    w, h = grid_size
-    bboxes = bboxes / (w, h, w, h)
-    return bboxes
-
-
-# ---
-# Define parameters
-grid_size = (8, 8)  # Example grid size (rows, columns)
-base_size = 1
-aspect_ratios = [0.5, 1.0, 2.0]
-scales = [1, 2, 3]
-
-# Generate anchor boxes
-anchor_boxes = generate_anchor_boxes(grid_size, base_size, aspect_ratios, scales)
-print(anchor_boxes)
-anchor_boxes = ccwh_to_xyxy(anchor_boxes)
-print(rel_to_grid(anchor_boxes, grid_size))
-
-# ---
-img = squares
-# Convert the anchor boxes to TensorFlow format
-anchor_boxes_tf = np.array(anchor_boxes, dtype=np.float32)
-anchor_boxes_tf = np.expand_dims(anchor_boxes_tf, axis=0)  # Add batch dimension
-
-# Create a TensorFlow tensor for the image
-img_tensor = tf.convert_to_tensor(img, dtype=tf.float32)
-img_tensor = np.expand_dims(img_tensor, axis=0)  # Add batch dimension
-
-# Draw anchor boxes on the image using TensorFlow
-drawn_img = tf.image.draw_bounding_boxes(
-    img_tensor, anchor_boxes_tf[0, 20 * 9 : 20 * 9 + 9][None], ((0.0, 1.0, 0.0),)
+from rcnn.data import (
+    generate_anchor_boxes,
+    generate_mnist,
+    generate_squares,
+    label_img,
+    make_batch,
+    gen_to_dataset,
+    mnist_generator,
+    pascal_voc
 )
-# drawn_img = tf.image.draw_bounding_boxes(img_tensor, bboxes[None], ((0.0, 1.0, 0.0),))
-
-# Convert the tensor to a NumPy array for visualization
-drawn_img = drawn_img.numpy()
+from rcnn.util import ccwh_to_xyxy, visualize_labels
 
 # ---
-# Display the image with anchor boxes
-plt.imshow(drawn_img[0])
+IMG_SHAPE = (256, 256, 3)
+square_size = 16
+grid_size = (32, 32)
+anc_size = 6
+anc_ratios = (0.5, 1.0, 2.0)
+anc_scales = (1, 2, 3)
+num_ancs = len(anc_ratios) * len(anc_scales)
+
+
+# ---
+# img = np.zeros(IMG_SHAPE)
+# squares, bboxes = generate_squares(50, square_size, img)
+# img, bboxes = generate_mnist(50, square_size, img)
+ancs = generate_anchor_boxes(grid_size, anc_size, anc_ratios, anc_scales)
+
+(ds_train, ds_test), ds_info = tfds.load(
+    "voc/2007",
+    split=["train", "test"],
+    shuffle_files=True,
+    with_info=True,
+)
+
+x = next(ds_train.as_numpy_iterator())
+img = x["image"] / 255.0
+bboxes = x["objects"]["bbox"]
+
+anc_mapping, offsets, pos_mask, neg_mask = label_img(bboxes, grid_size, ancs)
+
+drawn_bboxes = visualize_labels(
+    img,
+    ancs,
+    offsets,
+    pos_mask.astype(np.float32),
+    anc_mapping,
+    show_heatmap=True,
+    n_ancs=num_ancs,
+    show_ancs=True,
+    show_offsets=True,
+    grid_size=grid_size,
+)
+
+plt.imshow(drawn_bboxes)
 plt.axis("off")
 plt.show()
 
 
 # ---
-def calculate_iou_array(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
-    """
-    Calculate the Intersection over Union (IoU) between arrays of bounding boxes.
+input_shape = IMG_SHAPE
+learning_rate = 1e-3
 
-    Args:
-        boxes1 (np.ndarray): Array of bounding box coordinates (N x 4), where N is the number of boxes.
-        boxes2 (np.ndarray): Array of bounding box coordinates (M x 4), where M is the number of boxes.
+# ---
 
-    Returns:
-        iou_matrix (np.ndarray): Matrix of IoU values (N x M).
-    """
-    x1_min = np.maximum(boxes1[:, 0][:, np.newaxis], boxes2[:, 0])
-    y1_min = np.maximum(boxes1[:, 1][:, np.newaxis], boxes2[:, 1])
-    x2_max = np.minimum(boxes1[:, 2][:, np.newaxis], boxes2[:, 2])
-    y2_max = np.minimum(boxes1[:, 3][:, np.newaxis], boxes2[:, 3])
+inputs = tf.keras.Input(input_shape)
+x = inputs
+x = tf.keras.layers.Conv2D(16, 3, strides=1, padding="same")(x)
+x = tf.keras.layers.MaxPooling2D(2)(x)
+x = tf.keras.layers.ReLU()(x)
+x = tf.keras.layers.Conv2D(32, 3, strides=1, padding="same")(x)
+x = tf.keras.layers.MaxPooling2D(2)(x)
+x = tf.keras.layers.ReLU()(x)
+x = tf.keras.layers.Conv2D(64, 3, strides=1, padding="same")(x)
+x = tf.keras.layers.MaxPooling2D(2)(x)
+x = tf.keras.layers.ReLU()(x)
+feat = x
+cls_out = tf.keras.layers.Conv2D(num_ancs, 1, padding="same")(feat)
+cls_out = tf.keras.layers.Flatten()(cls_out)
 
-    intersection_area = np.maximum(0, x2_max - x1_min) * np.maximum(0, y2_max - y1_min)
+reg_out = tf.keras.layers.Conv2D(num_ancs * 4, 1, padding="same")(feat)
+reg_out = tf.keras.layers.Reshape((-1, 4))(reg_out)
 
-    box1_area = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    box2_area = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+model = tf.keras.Model(inputs, [cls_out, reg_out])
+model.compile()
+optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
 
-    union_area = box1_area[:, np.newaxis] + box2_area - intersection_area
+model.summary()
 
-    iou_matrix = intersection_area / union_area
-    iou_matrix[union_area <= 0] = 0.0  # Set IoU to 0 where union area is non-positive
-
-    return iou_matrix
-
-
-# Example arrays of bounding boxes in the format (x1, y1, x2, y2)
-boxes1 = np.array([[50, 50, 150, 150], [100, 100, 200, 200], [200, 200, 300, 300]])
-
-boxes2 = np.array(
-    [
-        [50, 50, 150, 150],
-        [75, 75, 175, 175],
-        [125, 125, 225, 225],
-        [250, 250, 350, 350],
-    ]
+# ---
+ancs = generate_anchor_boxes(grid_size, anc_size, anc_ratios, anc_scales)
+xy_ancs = ccwh_to_xyxy(ancs)
+out_of_bounds_mask = np.any(xy_ancs < (0, 0, 0, 0), axis=-1) | np.any(
+    xy_ancs > (1.0, 1.0, 1.0, 1.0), axis=-1
 )
 
-# Calculate IoU matrix
-iou_matrix = calculate_iou_array(boxes1, boxes2)
-print("IoU Matrix:\n", iou_matrix)
+steps = 1000
+batch_size = 64
 
+num_pos_tot = 0
+num_neg_tot = 0
 
-# ---
-def calculate_offsets(anc: np.ndarray, gt: np.ndarray) -> np.ndarray:
-    x_a, y_a, w_a, h_a = anc.T
-    x, y, w, h = gt.T
+canvas = np.zeros(IMG_SHAPE)
+# ds_train = gen_to_dataset(
+#     lambda: mnist_generator(15, square_size, canvas, grid_size, ancs, batch_size), n=steps
+# )
+ds_train = pascal_voc(IMG_SHAPE, grid_size, ancs, batch_size)
+epochs = 100
 
-    t_x = (x - x_a) / w_a
-    t_y = (y - y_a) / h_a
-    t_w = np.log(w / w_a)
-    t_h = np.log(h / h_a)
+for epoch in range(epochs):
+    print(f"### EPOCH {epoch} ###")
+    for step, (img, pos_samples, neg_samples, samples, cls_true, reg_true) in enumerate(ds_train):
+        # num_objects = random.randint(10, 20)
+        # # img, bboxes = generate_squares(num_squares, square_size, canvas)
+        # img, bboxes = generate_mnist(num_objects, square_size, canvas)
+        # img, pos_samples, neg_samples, samples, cls_true, reg_true = make_batch(
+        #     img, bboxes, grid_size, ancs, batch_size
+        # )
 
-    return np.stack((t_x, t_y, t_w, t_h), axis=-1)
+        with tf.GradientTape() as tape:
+            cls_pred, reg_pred = model(img[None, ...], training=True)
+            cls_pred = tf.gather(cls_pred[0], samples)
+            reg_pred = tf.gather(reg_pred[0], pos_samples)
 
+            cls_loss = tf.losses.binary_crossentropy(cls_true, cls_pred, from_logits=True)
+            cls_loss = tf.reduce_sum(cls_loss)
+            cls_loss *= 1 / tf.cast(tf.shape(samples)[0], tf.float32)
+            reg_loss = tf.reduce_sum(tf.losses.huber(reg_true, reg_pred, delta=0.3))
+            reg_loss *= 10 / (grid_size[0] * grid_size[1] * num_ancs)
+            loss_value = cls_loss + reg_loss
 
-def apply_offsets(anc: np.ndarray, offset: np.ndarray) -> np.ndarray:
-    x_a, y_a, w_a, h_a = anc.T
-    t_x, t_y, t_w, t_h = offset.T
+        acc = tf.keras.metrics.BinaryAccuracy()(cls_true, cls_pred)
 
-    x = t_x * w_a + x_a
-    y = t_y * h_a + y_a
-    w = np.exp(t_w) * w_a
-    h = np.exp(t_h) * h_a
+        grads = tape.gradient(loss_value, model.trainable_weights)
+        optimizer.apply_gradients(zip(grads, model.trainable_weights))
 
-    return np.stack((x, y, w, h), axis=-1)
+        if step % 100 == 0:
+            print(
+                "Training loss (for one batch) at step %d: %.8f, cls_closs: %.8f, reg_loss: %.8f, accuracy: %f, learning_rate: %f"
+                % (step, float(loss_value), float(cls_loss), float(reg_loss), acc, learning_rate)
+            )
+            print("Seen so far: %s samples" % ((step + 1) * batch_size))
+        # if step % 3000 == 0 and step != 0:
+        #     learning_rate = learning_rate * 0.1
+        #     optimizer.learning_rate = learning_rate
 
-
-# ---
-
-
-def label_img(
-    bboxes: np.ndarray,
-    grid_size: Tuple[int, int],
-    pos_thresh: float = 0.7,
-    neg_thresh=0.5,
-    anc_size: int = 1,
-    anc_ratios=(0.5, 1.0, 2.0),
-    sclaes=(1, 2, 3),
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    ancs = generate_anchor_boxes(grid_size, base_size, aspect_ratios, scales)
-    ancs = ccwh_to_xyxy(ancs)
-    A = ancs.shape[0]
-    B = bboxes.shape[0]
-    anc_mapping = np.zeros(A, dtype=int)  # (A, ) maps each anchor to a gt bbox
-    iou = calculate_iou_array(ancs, bboxes)  # (A, B)
-
-    # map each gt bbox to a anchor
-    max_iou_for_gt_idx = np.argmax(iou, axis=0)  # (B, )
-    anc_mapping[max_iou_for_gt_idx] = np.arange(B)
-    pre_mapped_mask = np.zeros(A, dtype=bool)
-    pre_mapped_mask[max_iou_for_gt_idx] = True
-
-    # map anc boxes with iou > pos_thesh to gt bbox
-    iou_thresh_mask = np.max(iou, axis=1) > pos_thresh  # (A, )
-    iou_thresh_mask &= ~pre_mapped_mask
-    max_iou_for_anc_idx = np.argmax(iou, axis=1)  # (A, )
-    anc_mapping[iou_thresh_mask] = max_iou_for_anc_idx[iou_thresh_mask]
-
-    pos_mask = pre_mapped_mask | iou_thresh_mask
-    neg_mask = np.max(iou, axis=1) < neg_thresh
-    neg_mask &= ~pos_mask
-
-    ancs = xyxy_to_ccwh(ancs)
-    mapped_bboxes = bboxes[anc_mapping]
-    mapped_bboxes = xyxy_to_ccwh(mapped_bboxes)
-    offsets = calculate_offsets(ancs, mapped_bboxes)
-
-    return anc_mapping, offsets, pos_mask, neg_mask
-
+print("########### TRAINING FINISHED ###########")
 
 # ---
-img = np.zeros(IMG_SHAPE)
-squares, bboxes = generate_squares(10, 9, img)
-anc_mapping, offsets, pos_mask, neg_mask = label_img(bboxes, grid_size)
-ancs = generate_anchor_boxes(grid_size)
-
-mapped_bboxes = apply_offsets(ancs, offsets)
-ancs = ccwh_to_xyxy(ancs)
-mapped_bboxes = ccwh_to_xyxy(mapped_bboxes)
-
-colors = (
-    (1.0, 0.0, 0.0),
-    (0.0, 1.0, 0.0),
-    (0.0, 0.0, 1.0),
-    (1.0, 1.0, 0.0),
-    (1.0, 0.0, 1.0),
-    (0.0, 1.0, 1.0),
-    (0.5, 1.0, 5.0),
-    (1.0, 5.0, 1.0),
-    (0.5, 1.0, 1.0),
-    (0.1, 0.4, 0.2),
+# img = np.zeros(IMG_SHAPE)
+# img, bboxes = generate_mnist(10, square_size, img)
+(ds_train, ds_test), ds_info = tfds.load(
+    "voc/2007",
+    split=["train", "test"],
+    shuffle_files=True,
+    with_info=True,
 )
 
-drawn_bboxes = squares[None, ...]
-for idx in np.where(pos_mask)[0]:
-    drawn_bboxes = tf.image.draw_bounding_boxes(
-        drawn_bboxes, mapped_bboxes[idx][None, None], (colors[anc_mapping[idx]],)
-    )
-    drawn_bboxes = tf.image.draw_bounding_boxes(
-        drawn_bboxes, ancs[idx][None, None], (colors[anc_mapping[idx]],)
-    )
+x = next(ds_test.as_numpy_iterator())
+img = tf.image.resize(x["image"] / 255.0, IMG_SHAPE[:2])
 
-# ---
-plt.imshow(drawn_bboxes[0])
+cls_pred, reg_pred = model(img[None, ...])
+cls_pred = tf.sigmoid(cls_pred)[0].numpy()
+reg_pred = reg_pred[0].numpy()
+
+drawn_bboxes = visualize_labels(
+    img,
+    ancs,
+    reg_pred,
+    cls_pred,
+    # anc_mapping,
+    show_ancs=False,
+    show_heatmap=True,
+    show_offsets=False,
+    n_ancs=num_ancs,
+    grid_size=grid_size,
+    thresh=0.6,
+    nms=True,
+)
+
+plt.imshow(drawn_bboxes)
+plt.axis("off")
 plt.show()
