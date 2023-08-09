@@ -25,28 +25,28 @@ from rcnn.util_tf import ccwh_to_xyxy, visualize_labels
 IMG_SHAPE = (256, 256, 3)
 square_size = 16
 grid_size = (32, 32)
-anc_size = 6
+anc_size = 3
 anc_ratios = (0.5, 1.0, 2.0)
 anc_scales = (1, 2, 3)
 num_ancs = len(anc_ratios) * len(anc_scales)
 
 
 # ---
-# img = np.zeros(IMG_SHAPE)
+img = tf.zeros(IMG_SHAPE)
 # squares, bboxes = generate_squares(50, square_size, img)
-# img, bboxes = generate_mnist(50, square_size, img)
+img, bboxes = generate_mnist(50, square_size, img)
 ancs = generate_anchor_boxes(grid_size, anc_size, anc_ratios, anc_scales)
 
-(ds_train, ds_test), ds_info = tfds.load(
-    "voc/2007",
-    split=["train", "test"],
-    shuffle_files=True,
-    with_info=True,
-)
-
-x = next(ds_train.as_numpy_iterator())
-img = x["image"] / 255.0
-bboxes = x["objects"]["bbox"]
+# (ds_train, ds_test), ds_info = tfds.load(
+#     "voc/2007",
+#     split=["train", "test"],
+#     shuffle_files=True,
+#     with_info=True,
+# )
+#
+# x = next(ds_train.as_numpy_iterator())
+# img = x["image"] / 255.0
+# bboxes = x["objects"]["bbox"]
 
 anc_mapping, offsets, pos_mask, neg_mask = label_img(bboxes, grid_size, ancs)
 
@@ -103,6 +103,9 @@ class RPN(tf.keras.Model):
 
         self.accuracy_metric = tf.keras.metrics.BinaryAccuracy()
 
+    def call(self, x, training=False):
+        return self.model(x)
+
     def train_step(self, data):
         img, label = data[0], data[1]
         with tf.GradientTape() as tape:
@@ -148,8 +151,8 @@ model.compile(optimizer)
 # ---
 ancs = generate_anchor_boxes(grid_size, anc_size, anc_ratios, anc_scales)
 
-steps = 1000
-batch_size = 64
+steps = 500
+batch_size = 32
 
 canvas = tf.zeros(IMG_SHAPE)
 ds_train = gen_to_dataset(
@@ -159,11 +162,6 @@ ds_train = gen_to_dataset(
 epochs = 1
 
 model.fit(ds_train, epochs=epochs)
-
-for x in ds_train:
-    print(x[1])
-    break
-
 
 # for epoch in range(epochs):
 #     print(f"### EPOCH {epoch} ###")
@@ -207,12 +205,12 @@ for x in ds_train:
 # # ---
 img = tf.zeros(IMG_SHAPE)
 img, bboxes = generate_mnist(10, square_size, img)
-(ds_train, ds_test), ds_info = tfds.load(
-    "voc/2007",
-    split=["train", "test"],
-    shuffle_files=True,
-    with_info=True,
-)
+# (ds_train, ds_test), ds_info = tfds.load(
+#     "voc/2007",
+#     split=["train", "test"],
+#     shuffle_files=True,
+#     with_info=True,
+# )
 
 # x = next(ds_test.as_numpy_iterator())
 # img = tf.image.resize(x["image"] / 255.0, IMG_SHAPE[:2])
@@ -229,7 +227,7 @@ drawn_bboxes = visualize_labels(
     # anc_mapping,
     show_ancs=False,
     show_heatmap=True,
-    show_offsets=False,
+    show_offsets=True,
     n_ancs=num_ancs,
     grid_size=grid_size,
     thresh=0.6,

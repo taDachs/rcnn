@@ -148,7 +148,7 @@ def visualize_labels(
 
     if nms:
         idx = tf.image.non_max_suppression(mapped_bboxes, pred, 30, score_threshold=thresh)
-        mapped_bboxes = mapped_bboxes[idx]
+        mapped_bboxes = tf.gather(mapped_bboxes, idx)
         for i, box in enumerate(mapped_bboxes):
             color = interpolated[i]
             if show_offsets:
