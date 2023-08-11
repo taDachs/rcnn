@@ -135,10 +135,6 @@ def generate_mnist(n: int, size: int, img: tf.Tensor) -> tuple:
     return img, bboxes_normalized
 
 
-
-
-
-
 def mnist_generator(n: int, size: int, img: tf.Tensor, grid_size, ancs, batch_size):
     while True:
         sample, bboxes = generate_mnist(n, size, img)
@@ -168,12 +164,14 @@ def gen_to_dataset(gen, n=None):
 
 def pascal_voc(input_shape, grid_size, ancs, batch_size):
 
-    (ds_train, ds_test), ds_info = tfds.load(
+    (ds_train, ds_val, ds_test), ds_info = tfds.load(
         "voc/2007",
-        split=["train", "test"],
+        split=["train", "validation", "test"],
         shuffle_files=True,
         with_info=True,
     )
+
+    ds_train = ds_train.concatenate(ds_val)
 
     def f(sample):
         img = tf.image.resize(tf.cast(sample["image"], tf.float32) / 255.0, input_shape[:2])
@@ -189,6 +187,7 @@ def pascal_voc(input_shape, grid_size, ancs, batch_size):
     ds_train = ds_train.map(f)
     ds_train = ds_train.map(g)
     ds_train = ds_train.batch(1)
+    ds_train = ds_train.shuffle(2500)
 
     # def gen():
     #     for sample in ds_train.as_numpy_iterator():
@@ -224,7 +223,7 @@ def generate_anchor_boxes(
         for y in range(grid_size[1]):
             for scale in scales:
                 for ratio in aspect_ratios:
-                    width = base_size * scale / grid_size[0]
+                    width = (base_size * scale / ratio) / grid_size[0]
                     height = base_size * scale * ratio / grid_size[1]
                     x_center = (x + 0.5) / grid_size[0]
                     y_center = (y + 0.5) / grid_size[1]
@@ -239,7 +238,7 @@ def label_img(
     grid_size: Tuple[int, int],
     ancs: tf.Tensor,
     pos_thresh: float = 0.5,
-    neg_thresh=0.3,
+    neg_thresh=0.1,
 ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
     ancs = ccwh_to_xyxy(ancs)
     A = tf.shape(ancs)[0]

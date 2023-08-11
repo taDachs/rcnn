@@ -133,6 +133,7 @@ def visualize_labels(
             (1.0, 0.0, 0.0),
         ]
     )
+
     interpolated = []
     for i in range(num_colors + 1):
         t: float = i / num_colors * (len(colors) - 1)
