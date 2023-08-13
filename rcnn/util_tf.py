@@ -4,10 +4,10 @@ import tensorflow as tf  # type: ignore
 
 
 def xyxy_to_ccwh(bboxes):
-    x1 = bboxes[:, 0]
-    y1 = bboxes[:, 1]
-    x2 = bboxes[:, 2]
-    y2 = bboxes[:, 3]
+    x1 = bboxes[..., 0]
+    y1 = bboxes[..., 1]
+    x2 = bboxes[..., 2]
+    y2 = bboxes[..., 3]
 
     w = x2 - x1
     h = y2 - y1
@@ -18,10 +18,10 @@ def xyxy_to_ccwh(bboxes):
 
 
 def ccwh_to_xyxy(bboxes):
-    x = bboxes[:, 0]
-    y = bboxes[:, 1]
-    w = bboxes[:, 2]
-    h = bboxes[:, 3]
+    x = bboxes[..., 0]
+    y = bboxes[..., 1]
+    w = bboxes[..., 2]
+    h = bboxes[..., 3]
     x1 = x - w / 2
     y1 = y - h / 2
     x2 = x + w / 2
@@ -102,87 +102,76 @@ def apply_offsets(anc: tf.Tensor, offset: tf.Tensor) -> tf.Tensor:
 def visualize_labels(
     img,
     ancs,
-    offsets,
-    pred,
-    anc_mapping=None,
-    thresh: float = 0.5,
-    show_ancs=True,
-    show_offsets=True,
+    gt_offsets=None,
+    pred_offsets=None,
+    gt_label=None,
+    pred_label=None,
+    show_ancs=False,
     show_heatmap=False,
+    stride=None,
     n_ancs=None,
-    grid_size=None,
+    thresh=0.5,
     nms=False,
 ):
-    pred_mask = pred > thresh
+    gt_color = (0.0, 1.0, 0.0)
+    pred_color = (1.0, 0.0, 0.0)
+    anc_color = (0.0, 0.0, 1.0)
 
-    mapped_bboxes = apply_offsets(ancs, offsets)
-    ancs = ccwh_to_xyxy(ancs)
-    mapped_bboxes = ccwh_to_xyxy(mapped_bboxes)
-
-    num_colors = tf.maximum(
-        tf.reduce_sum(tf.cast(pred_mask, tf.int32)), tf.reduce_max(anc_mapping) if anc_mapping is not None else 0
-    )
-    colors = tf.constant(
-        [
-            (1.0, 0.0, 0.0),
-            (1.0, 1.0, 0.0),
-            (0.0, 1.0, 0.0),
-            (0.0, 1.0, 1.0),
-            (0.0, 0.0, 1.0),
-            (1.0, 0.0, 1.0),
-            (1.0, 0.0, 0.0),
-        ]
-    )
-
-    interpolated = []
-    for i in range(num_colors + 1):
-        t: float = i / num_colors * (len(colors) - 1)
-        a = colors[math.floor(t)]
-        b = colors[math.ceil(t)]
-
-        alpha = tf.cast(t - math.floor(t), tf.float32)
-
-        color = alpha * a + (1 - alpha) * b
-        interpolated.append(color)
+    xy_ancs = ccwh_to_xyxy(ancs)
 
     drawn_bboxes = img[None, ...]
 
-    if nms:
-        idx = tf.image.non_max_suppression(mapped_bboxes, pred, 30, score_threshold=thresh)
-        mapped_bboxes = tf.gather(mapped_bboxes, idx)
-        for i, box in enumerate(mapped_bboxes):
-            color = interpolated[i]
-            if show_offsets:
-                drawn_bboxes = tf.image.draw_bounding_boxes(drawn_bboxes, box[None, None], (color,))
-    else:
-        for i, idx in enumerate(tf.where(pred_mask)):
-            idx = idx[0]
-            color = interpolated[anc_mapping[idx]] if anc_mapping is not None else interpolated[i]
-            if show_offsets:
-                drawn_bboxes = tf.image.draw_bounding_boxes(
-                    drawn_bboxes, mapped_bboxes[idx][None, None], (color,)
-                )
+    if gt_offsets is not None and gt_label is not None:
+        gt_bboxes = apply_offsets(ancs, gt_offsets)
+        gt_bboxes = ccwh_to_xyxy(gt_bboxes)
+        drawn_bboxes = tf.image.draw_bounding_boxes(
+            drawn_bboxes, gt_bboxes[gt_label > thresh][None, ...], (gt_color,)
+        )
+    if show_ancs and gt_label is not None:
+        drawn_bboxes = tf.image.draw_bounding_boxes(
+            drawn_bboxes, xy_ancs[gt_label > thresh][None, ...], (anc_color,)
+        )
 
-            if show_ancs:
-                drawn_bboxes = tf.image.draw_bounding_boxes(
-                    drawn_bboxes, ancs[idx][None, None], (color,)
-                )
-
-    drawn_bboxes = drawn_bboxes
+    if pred_offsets is not None and pred_label is not None:
+        pred_bboxes = apply_offsets(ancs, pred_offsets)
+        pred_bboxes = ccwh_to_xyxy(pred_bboxes)
+        drawn_bboxes = tf.image.draw_bounding_boxes(
+            drawn_bboxes, pred_bboxes[pred_label > thresh][None, ...], (pred_color,)
+        )
+    if show_ancs and pred_label is not None:
+        drawn_bboxes = tf.image.draw_bounding_boxes(
+            drawn_bboxes, xy_ancs[pred_label > thresh][None, ...], (anc_color,)
+        )
 
     if show_heatmap:
-        pred_img = tf.reshape(pred, (*grid_size, n_ancs))
-        pred_img = tf.reduce_max(pred_img, axis=-1)
-        pred_img = tf.image.resize(pred_img[..., None], img.shape[:2])[:, :, 0]
-        alpha = 0.5
-        drawn_bboxes = tf.concat(
-            [
-                drawn_bboxes[..., :2],
-                drawn_bboxes[..., 2:3] * (1.0 - alpha) + pred_img[..., tf.newaxis] * alpha,
-                drawn_bboxes[..., 3:]
-            ],
-            axis=-1
-        )
+        grid_size = (tf.shape(img)[0] // stride, tf.shape(img)[1] // stride)
+        if pred_label is not None:
+            pred_label_img = tf.reshape(pred_label, (*grid_size, n_ancs))
+            pred_label_img = tf.reduce_max(pred_label_img, axis=-1)
+            pred_label_img = tf.image.resize(pred_label_img[..., None], img.shape[:2])[:, :, 0]
+            alpha = 0.5
+            drawn_bboxes = tf.concat(
+                [
+                    drawn_bboxes[..., :2],
+                    drawn_bboxes[..., 2:3] * (1.0 - alpha)
+                    + pred_label_img[..., tf.newaxis] * alpha,
+                    drawn_bboxes[..., 3:],
+                ],
+                axis=-1,
+            )
+        if gt_label is not None:
+            gt_label_img = tf.reshape(gt_label, (*grid_size, n_ancs))
+            gt_label_img = tf.reduce_max(gt_label_img, axis=-1)
+            gt_label_img = tf.image.resize(gt_label_img[..., None], img.shape[:2])[:, :, 0]
+            alpha = 0.5
+            drawn_bboxes = tf.concat(
+                [
+                    drawn_bboxes[..., :2],
+                    drawn_bboxes[..., 2:3] * (1.0 - alpha) + gt_label_img[..., tf.newaxis] * alpha,
+                    drawn_bboxes[..., 3:],
+                ],
+                axis=-1,
+            )
 
     return drawn_bboxes[0]
 
