@@ -4,6 +4,7 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 import matplotlib
 import matplotlib.pyplot as plt
+import cv2
 
 from typing import Sequence
 
@@ -252,21 +253,20 @@ def visualize_model_output(ds, model):
     it = ds.as_numpy_iterator()
     for x in it:
         img = x[0][0]
-        rpn_map, batch_cls_mask, _ = x[1]
-        cls, reg = model(img[None, ...])
+        gt_bboxes = x[1][0]
+
+        ancs, anc_valid = generate_anchor_map(img, STRIDE, ANC_SIZES, ANC_RATIOS)
+        rpn_map = generate_rpn_map(ancs, anc_valid, gt_bboxes, POS_THRESH, NEG_THRESH)
+
+        cls, reg, proposals = model((img[None, ...], ancs[None, ...], anc_valid[None, ...]))
         #     print(tf.shape(batch_cls_mask))
         #     print(tf.shape(rpn_map))
         #     print(tf.shape(cls))
-        rpn_map = rpn_map[0]
+        rpn_map = rpn_map
         anc_map, anc_valid_mask = generate_anchor_map(img, 16, ANC_SIZES, ANC_RATIOS)
         rpn_img = draw_rpn_map(img, anc_map, rpn_map, True)
-        ancs = tf.reshape(anc_map, (-1, 4))
-        offsets = tf.reshape(reg, (-1, 4))
-        bboxes = apply_offsets(ancs, offsets)
-        bboxes = ccwh_to_xyxy(bboxes)
-        bboxes_idx = tf.image.non_max_suppression(bboxes, tf.reshape(cls, (-1,)), 10, 0.8, 0.5)
         predicted_img = tf.image.draw_bounding_boxes(
-            img[None, ...], tf.gather(bboxes, bboxes_idx)[None, ...], ((0, 1, 0),)
+            img[None, ...], proposals[None, ...], ((0, 1, 0),)
         )[0]
         #     # batch_cls_mask, batch_reg_mask = select_minibatch(rpn_map, 256)
         #     # print(tf.reduce_sum(batch_reg_mask))
@@ -287,22 +287,27 @@ def visualize_minibatch(ds):
     it = ds.as_numpy_iterator()
     for x in it:
         img = x[0][0]
-        rpn_map, batch_cls_mask, batch_reg_mask = x[1]
-        rpn_map = rpn_map[0]
-        batch_cls_mask = batch_cls_mask[0]
-        batch_reg_mask = batch_reg_mask[0]
+        gt_bboxes = x[1][0]
+        labels = x[2][0]
         anc_map, anc_valid_mask = generate_anchor_map(img, 16, ANC_SIZES, ANC_RATIOS)
+        rpn_map = generate_rpn_map(anc_map, anc_valid_mask, gt_bboxes, POS_THRESH, NEG_THRESH)
+        batch_cls_mask, batch_reg_mask = select_minibatch(rpn_map, BATCH_SIZE)
         img = img[None, ...]
         img = tf.image.draw_bounding_boxes(
-            img, ccwh_to_xyxy(anc_map[batch_reg_mask > 0][None, ...]), ((0.0, 1.0, 0.0),)
+            img, gt_bboxes[None, ...], ((0.0, 1.0, 0.0),)
         )
         img = tf.image.draw_bounding_boxes(
             img, ccwh_to_xyxy(anc_map[rpn_map[..., 1] > 0][None, ...]), ((1.0, 0.0, 0.0),)
         )
+        img = img[0].numpy()
+        w, h = img.shape[:2]
+        for box, label in zip(gt_bboxes, labels):
+            pos = (int(box[1] * h), int(box[0] * w))
+            img = cv2.putText(img, str(label), pos, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 1), 3, cv2.LINE_AA)
         print(tf.reduce_sum(batch_reg_mask))
         print(tf.reduce_sum(rpn_map[..., 1]))
         fig, axs = plt.subplots(2)
-        axs[0].imshow(img[0])
+        axs[0].imshow(img)
         axs[1].imshow(tf.reduce_max(batch_cls_mask, axis=-1))
         plt.show()
 
@@ -396,23 +401,22 @@ def mnist_dataset(
         as_supervised=True,
         with_info=True,
     )
-    ds = ds.map(lambda x, y: x)
     ds = ds.batch(num_mnist)
 
-    def f(x):
+    def f(x, y):
         mnist_img, bboxes = generate_mnist(x, size, img)
-        return mnist_img, bboxes
+        return mnist_img, bboxes, y
 
-    def g(img, bbox):
-        anc_map, anc_valid_mask = generate_anchor_map(img, stride, anc_scales, anc_ratios)
-        rpn_map = generate_rpn_map(anc_map, anc_valid_mask, bbox, POS_THRESH, NEG_THRESH)
-        batch_cls_mask, batch_reg_mask = select_minibatch(rpn_map, batch_size)
-
-        return img, (rpn_map, batch_cls_mask, batch_reg_mask)
+    # def g(img, bbox, label):
+    #     anc_map, anc_valid_mask = generate_anchor_map(img, stride, anc_scales, anc_ratios)
+    #     rpn_map = generate_rpn_map(anc_map, anc_valid_mask, bbox, POS_THRESH, NEG_THRESH)
+    #     batch_cls_mask, batch_reg_mask = select_minibatch(rpn_map, batch_size)
+    #
+    #     return img, (rpn_map, batch_cls_mask, batch_reg_mask, label)
 
     # ds_train = ds_train.shuffle(5000)
     ds = ds.map(f)
-    ds = ds.map(g)
+    # ds = ds.map(g)
     ds = ds.batch(1)
     return ds
 
@@ -434,10 +438,113 @@ class Rpn(tf.keras.Model):
         self.anc_ratios = anc_ratios
         self.num_ancs = len(anc_ratios) * len(anc_sizes)
 
+        self.max_proposals_pre_nms = 12000
+        self.max_proposals_post_nms = 2000
+
         regularizer = tf.keras.regularizers.l2()
         initial_weights = tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.01, seed=None)
 
-        # backbone = tf.keras.applications.MobileNetV2(input_tensor=inputs, include_top=False)
+        self.bottleneck = tf.keras.layers.Conv2D(
+            256,
+            1,
+            padding="same",
+            activation="relu",
+            kernel_initializer=initial_weights,
+            kernel_regularizer=regularizer,
+        )
+        self.cls_out = tf.keras.layers.Conv2D(
+            self.num_ancs,
+            1,
+            padding="same",
+            activation="sigmoid",
+            kernel_initializer=initial_weights,
+        )
+
+        self.reg_out = tf.keras.layers.Conv2D(
+            self.num_ancs * 4, 1, padding="same", kernel_initializer=initial_weights
+        )
+
+        self.accuracy_metric = tf.keras.metrics.BinaryAccuracy()
+
+    def call(self, x, training=False):
+        feats, ancs, ancs_valid = x[0], x[1], x[2]
+        tf.print(tf.shape(feats))
+        feats = self.bottleneck(feats)
+        cls_pred = self.cls_out(feats)
+        reg_pred = self.reg_out(feats)
+        reg_pred = tf.reshape(
+            reg_pred, tf.concat((tf.shape(reg_pred)[:-1], [self.num_ancs, 4]), axis=0)
+        )
+
+        proposals = self.extract_proposals(cls_pred, reg_pred, ancs, ancs_valid)
+
+        return cls_pred, reg_pred, proposals
+
+    def extract_proposals(self, cls_pred, reg_pred, ancs, ancs_valid):
+        cls_pred = tf.reshape(cls_pred, (-1,))
+        reg_pred = tf.reshape(reg_pred, (-1, 4))
+        ancs = tf.reshape(ancs, (-1, 4))
+        ancs_valid = tf.reshape(ancs_valid, (-1,))
+
+        cls_pred = cls_pred[ancs_valid > 0]
+        reg_pred = ancs[ancs_valid > 0]
+        ancs = ancs[ancs_valid > 0]
+
+        proposals = apply_offsets(ancs, reg_pred)
+        proposals = ccwh_to_xyxy(proposals)
+
+        sorted_indices = tf.argsort(cls_pred)[::-1]  # descending order
+        proposals = tf.gather(proposals, sorted_indices)[: self.max_proposals_pre_nms]
+        objectness = tf.gather(cls_pred, sorted_indices)[: self.max_proposals_pre_nms]
+
+        idx = tf.image.non_max_suppression(proposals, objectness, self.max_proposals_post_nms, 0.7)
+
+        return tf.gather(proposals, idx)
+
+    @staticmethod
+    def cls_loss(cls_pred, gt_rpn_map, batch_cls_mask):
+        loss = tf.reduce_sum(
+            tf.losses.binary_crossentropy(
+                gt_rpn_map[batch_cls_mask > 0][..., 1, None],
+                cls_pred[batch_cls_mask > 0][..., None],
+            )
+        )
+        loss /= tf.maximum(tf.reduce_sum(batch_cls_mask), 1)
+        return loss
+
+    @staticmethod
+    def reg_loss(reg_pred, gt_rpn_map, batch_reg_mask):
+        loss = tf.reduce_sum(
+            tf.losses.huber(
+                gt_rpn_map[..., 2:][batch_reg_mask > 0][..., None],
+                reg_pred[batch_reg_mask > 0][..., None],
+            )
+        )
+        loss /= tf.maximum(tf.reduce_sum(batch_reg_mask), 1)
+        return loss
+
+
+class FasterRCNN(tf.keras.Model):
+    def __init__(
+        self,
+        stride: int,
+        batch_size: int,
+        anc_sizes: Sequence[int],
+        anc_ratios: Sequence[float],
+        *args,
+        **kwargs,
+    ):
+        super().__init__(self, *args, **kwargs)
+        self.stride = stride
+        self.batch_size = batch_size
+        self.anc_sizes = anc_sizes
+        self.anc_ratios = anc_ratios
+
+        self.backbone = self._build_backbone()
+        self.rpn = Rpn(stride, batch_size, anc_sizes, anc_ratios)
+        self.cls_accuracy_metric = tf.keras.metrics.BinaryAccuracy()
+
+    def _build_backbone(self) -> tf.keras.Model:
         # feat = backbone.get_layer("block_13_expand_relu").output
         # backbone = tf.keras.applications.ResNet50(include_top=False)
         backbone = tf.keras.applications.VGG16(include_top=False)
@@ -445,87 +552,50 @@ class Rpn(tf.keras.Model):
         # feat = backbone.get_layer("conv4_block6_out").output
         feat = backbone.get_layer("block5_conv3").output
         # feat = backbone.get_layer("conv4_block23_out").output
-        # feat = backbone.output
-        feat = tf.keras.layers.Conv2D(
-            256,
-            1,
-            padding="same",
-            activation="relu",
-            kernel_initializer=initial_weights,
-            kernel_regularizer=regularizer,
-        )(feat)
-        cls_out = tf.keras.layers.Conv2D(
-            self.num_ancs,
-            1,
-            padding="same",
-            activation="sigmoid",
-            kernel_initializer=initial_weights,
-        )(feat)
-
-        reg_out = tf.keras.layers.Conv2D(
-            self.num_ancs * 4, 1, padding="same", kernel_initializer=initial_weights
-        )(feat)
-
-        self.model = tf.keras.Model(backbone.inputs, [cls_out, reg_out])
-
-        self.accuracy_metric = tf.keras.metrics.BinaryAccuracy()
+        return tf.keras.Model(backbone.inputs, feat)
 
     def call(self, x, training=False):
-        return self.model(x)
+        img, ancs, anc_valid = x[0], x[1], x[2]
+        feats = self.backbone(img)
+        return self.rpn((feats, ancs, anc_valid))
 
     def train_step(self, data):
-        img, bboxes = data[0], data[1]
+        img = data[0]
+        gt_bboxes, labels = data[1]
 
         anc_map, anc_valid = generate_anchor_map(
             img[0], self.stride, self.anc_sizes, self.anc_ratios
         )
-        rpn_map = generate_rpn_map(anc_map, anc_valid, bboxes[0], POS_THRESH, NEG_THRESH)
-        batch_cls_mask, batch_reg_mask = select_minibatch(rpn_map, self.batch_size)
+        gt_rpn_map = generate_rpn_map(anc_map, anc_valid, gt_bboxes[0], POS_THRESH, NEG_THRESH)
+        batch_cls_mask, batch_reg_mask = select_minibatch(gt_rpn_map, self.batch_size)
 
         with tf.GradientTape() as tape:
-            cls_pred, reg_pred = self.model(img)
+            feats = self.backbone(img)
+            cls_pred, reg_pred, proposals = self.rpn((feats, anc_map, anc_valid))
             cls_pred = cls_pred[0]
             reg_pred = reg_pred[0]
-            reg_pred = tf.reshape(reg_pred, (tf.shape(rpn_map[..., 2:])))
+            cls_loss = Rpn.cls_loss(cls_pred, gt_rpn_map, batch_cls_mask)
+            reg_loss = Rpn.reg_loss(reg_pred, gt_rpn_map, batch_reg_mask)
+            loss = cls_loss + reg_loss
 
-            cls_loss = tf.reduce_sum(
-                tf.losses.binary_crossentropy(
-                    rpn_map[batch_cls_mask > 0][..., 1, None],
-                    cls_pred[batch_cls_mask > 0][..., None],
-                )
-            )
-            cls_loss /= tf.maximum(tf.reduce_sum(batch_cls_mask), 1)
+        grads = tape.gradient(loss, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
 
-            reg_loss = tf.reduce_sum(
-                tf.losses.huber(
-                    rpn_map[..., 2:][batch_reg_mask > 0][..., None],
-                    reg_pred[batch_reg_mask > 0][..., None],
-                )
-            )
-            reg_loss /= tf.maximum(tf.reduce_sum(batch_reg_mask), 1)
-            loss_value = cls_loss + reg_loss
-
-        grads = tape.gradient(loss_value, self.model.trainable_weights)
-        self.optimizer.apply_gradients(zip(grads, self.model.trainable_weights))
-
-        num_pos = tf.reduce_sum(rpn_map[..., 1][batch_cls_mask > 0])
-        num_neg = tf.reduce_sum(1 - rpn_map[..., 1][batch_cls_mask > 0])
+        num_pos = tf.reduce_sum(gt_rpn_map[..., 1][batch_cls_mask > 0])
+        num_neg = tf.reduce_sum(1 - gt_rpn_map[..., 1][batch_cls_mask > 0])
         # num_samples = tf.reduce_sum(batch_cls_mask)
-        acc = self.accuracy_metric(
-            tf.cast(rpn_map[batch_cls_mask > 0][..., 1, None] > 0.5, tf.float32),
+        cls_acc = self.cls_accuracy_metric(
+            tf.cast(gt_rpn_map[batch_cls_mask > 0][..., 1, None] > 0.5, tf.float32),
             cls_pred[batch_cls_mask > 0][..., None],
         )
-        # tf.print("num_pos: ", num_pos)
-        # tf.print(num_neg)
 
         return {
-            "loss": loss_value,
+            "loss": loss,
             "cls_loss": cls_loss,
             "reg_loss": reg_loss,
             "num_pos": num_pos,
             "num_neg": num_neg,
-            # "num_samples": num_samples,
-            "acc": acc,
+            "cls_acc": cls_acc,
         }
 
 
@@ -536,24 +606,24 @@ def main():
     # anc_map, anc_valid_mask = generate_anchor_map(img, 16, [128, 256, 512], [0.5, 1.0, 2.0])
     # rpn_map = generate_rpn_map(anc_map, anc_valid_mask, gt_bboxes, 0.3, 0.0)
     # anc_img = draw_anc_map(img, anc_map, anc_valid_mask)
-    model = Rpn(STRIDE, BATCH_SIZE, ANC_SIZES, ANC_RATIOS)
-    # canvas = tf.zeros((600, 700, 3))
-    ds = pascal_voc(STRIDE, BATCH_SIZE, ANC_RATIOS, ANC_SIZES, IMG_SIZE)
-    # ds = mnist_dataset(100, 10, canvas, STRIDE, BATCH_SIZE, ANC_RATIOS, ANC_SIZES)
+    model = FasterRCNN(STRIDE, BATCH_SIZE, ANC_SIZES, ANC_RATIOS)
+    canvas = tf.zeros((600, 700, 3))
+    # ds = pascal_voc(STRIDE, BATCH_SIZE, ANC_RATIOS, ANC_SIZES, IMG_SIZE)
+    ds = mnist_dataset(100, 10, canvas, STRIDE, BATCH_SIZE, ANC_RATIOS, ANC_SIZES)
     # ds = ds.take(1)
     # model.load_weights("./test_new_anchors/weights")
     # visualize_model_output(ds, model)
-    # visualize_minibatch(ds)
+    visualize_minibatch(ds)
 
     # out = model.call(tf.zeros((1, 500, 600, 3)))
     # print(tf.shape(out[0]))
     # exit()
     # model.compile(tf.keras.optimizers.Adam(1e-3))
     model.compile(tf.keras.optimizers.SGD(1e-3))
-    model.fit(ds, epochs=10, workers=14)
+    model.fit(ds, epochs=1, workers=14)
     # model.compile(tf.keras.optimizers.Adam(1e-4))
-    model.compile(tf.keras.optimizers.SGD(1e-4))
-    model.fit(ds, epochs=5, workers=14)
+    # model.compile(tf.keras.optimizers.SGD(1e-4))
+    # model.fit(ds, epochs=5, workers=14)
     model.save_weights("./test_new_anchors/weights")
 
 
