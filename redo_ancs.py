@@ -154,7 +154,8 @@ def select_minibatch(rpn_map, batch_size):
 
     pos_idx = tf_random_choice(tf.where(foreground_mask), tf.cast(batch_size // 2, tf.int64))
     num_pos = tf.shape(pos_idx)[0]
-    num_neg = tf.maximum(num_pos, 1)
+    # num_neg = tf.maximum(num_pos, 1)
+    num_neg = batch_size - num_pos
     neg_idx = tf_random_choice(tf.where(background_mask), num_neg)
 
     batch_cls_mask = tf.scatter_nd(
@@ -205,7 +206,7 @@ def pascal_voc(
     ds_train = ds_train.map(f)
     ds_train = ds_train.batch(1)
 
-    return ds_train
+    return ds_train, ds_info.features["labels"].names
 
 
 def draw_anc_map(img, anc_map, anc_valid_mask):
@@ -240,7 +241,7 @@ def draw_rpn_map(img, anc_map, rpn_map, show_ancs=False):
     return img[0]
 
 
-def visualize_model_output(ds, model):
+def visualize_model_output(ds, model, mapping):
     it = ds.as_numpy_iterator()
     for x in it:
         img = x[0][0]
@@ -272,6 +273,7 @@ def visualize_model_output(ds, model):
         proposals = proposals[mask]
         label_pred = label_pred[mask]
         scores = scores[mask]
+        scores = tf.ones_like(scores)
 
         proposals_idx = tf.image.non_max_suppression(proposals, scores, 20)
         proposals = tf.gather(proposals, proposals_idx)
@@ -290,7 +292,7 @@ def visualize_model_output(ds, model):
             pos = (int(box[1] * h), int(box[0] * w))
             predicted_img = cv2.putText(
                 predicted_img,
-                str(label),
+                mapping[label - 1],
                 pos,
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,
@@ -302,7 +304,7 @@ def visualize_model_output(ds, model):
             pos = (int(box[1] * h), int(box[0] * w))
             predicted_img = cv2.putText(
                 predicted_img,
-                str(label.numpy()),
+                mapping[label.numpy()],
                 pos,
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,
@@ -709,7 +711,7 @@ class FasterRCNN(tf.keras.Model):
         return tf.keras.Model(backbone.inputs, feat)
 
     def _assign_labels_to_proposals(self, proposals, gt_bboxes, gt_labels):
-        # proposals = tf.concat((proposals, gt_bboxes), axis=0)
+        proposals = tf.concat((proposals, gt_bboxes), axis=0)
         iou = compute_iou(proposals, gt_bboxes)
 
         best_iou = tf.reduce_max(iou, axis=1)
@@ -739,7 +741,8 @@ class FasterRCNN(tf.keras.Model):
             tf.reduce_sum(tf.cast(foreground_mask, tf.int64)), self.detector_batch_size // 2
         )
         foreground_idx = tf_random_choice(tf.where(foreground_mask)[:, 0], num_pos)
-        num_neg = tf.maximum(num_pos, 1)
+        # num_neg = tf.maximum(num_pos, 1)
+        num_neg = self.detector_batch_size - num_pos
         background_idx = tf_random_choice(tf.where(background_mask)[:, 0], num_neg)
 
         idx = tf.concat((foreground_idx, background_idx), axis=0)
@@ -826,16 +829,16 @@ class FasterRCNN(tf.keras.Model):
 def main():
     matplotlib.use("GTK3Agg")  # Or any other X11 back-end
     model = FasterRCNN(BATCH_SIZE, ANC_SIZES, ANC_RATIOS, NUM_CLASSES, ROI_SIZE)
-    ds = pascal_voc(BATCH_SIZE, ANC_RATIOS, ANC_SIZES, IMG_SIZE)
+    ds, label_mapping = pascal_voc(BATCH_SIZE, ANC_RATIOS, ANC_SIZES, IMG_SIZE)
     # canvas = tf.zeros((600, 1000, 3))
     # ds = mnist_dataset(100, 10, canvas, BATCH_SIZE, ANC_RATIOS, ANC_SIZES, 6000)
-    # model.load_weights("./test_new_anchors/weights")
-    # visualize_model_output(ds, model)
+    model.load_weights("./test_new_anchors/weights")
+    visualize_model_output(ds, model, label_mapping)
     # visualize_minibatch(ds)
 
     callbacks = [
-        tf.keras.callbacks.ReduceLROnPlateau("loss", patience=3),
-        tf.keras.callbacks.EarlyStopping("loss", patience=5),
+        # tf.keras.callbacks.ReduceLROnPlateau("loss", patience=3),
+        # tf.keras.callbacks.EarlyStopping("loss", patience=5),
         tf.keras.callbacks.TerminateOnNaN(),
         tf.keras.callbacks.ModelCheckpoint(
             "./checkpoints/chkpt", "loss", save_best_only=True, save_weights_only=True
@@ -845,10 +848,10 @@ def main():
     # model.compile(tf.keras.optimizers.Adam(1e-3))
     model.compile(tf.keras.optimizers.SGD(1e-3, momentum=0.9, weight_decay=WEIGHT_DECAY))
     # model.compile(tf.keras.optimizers.SGD(1e-3))
-    model.fit(ds, epochs=100, workers=14, callbacks=callbacks)
+    model.fit(ds, epochs=10, workers=14, callbacks=callbacks)
     # model.compile(tf.keras.optimizers.Adam(1e-4))
-    # model.compile(tf.keras.optimizers.SGD(1e-4, momentum=0.0, weight_decay=0.0005))
-    # model.fit(ds, epochs=5, workers=14)
+    model.compile(tf.keras.optimizers.SGD(1e-4, momentum=0.9, weight_decay=WEIGHT_DECAY))
+    model.fit(ds, epochs=5, workers=14)
     # model.compile(tf.keras.optimizers.SGD(1e-5, momentum=0.0, weight_decay=0.0005))
     # model.fit(ds, epochs=5, workers=14)
     model.save_weights("./test_new_anchors/weights")
