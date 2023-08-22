@@ -5,17 +5,9 @@ import tensorflow_datasets as tfds
 import matplotlib
 import matplotlib.pyplot as plt
 import cv2
-import numpy as np
+import argparse
 
 from typing import Sequence
-
-from rcnn.util_tf import (
-    xyxy_to_ccwh,
-    ccwh_to_xyxy,
-    calculate_offsets,
-    apply_offsets,
-    tf_random_choice,
-)
 
 ANC_RATIOS = (0.5, 1.0, 2.0)
 ANC_SIZES = (128, 256, 512)
@@ -28,6 +20,73 @@ NUM_CLASSES = 21
 ROI_SIZE = 7
 WEIGHT_DECAY = 5e-4
 L2 = 0.5 * WEIGHT_DECAY
+
+DETECTOR_BOX_OFFSET_MEAN = tf.constant((0.0, 0.0, 0.0, 0.0))
+# DETECTOR_BOX_OFFSET_STD = tf.constant((0.1, 0.1, 0.2, 0.2))
+DETECTOR_BOX_OFFSET_STD = tf.constant((1.0, 1.0, 1.0, 1.0))
+
+def tf_random_choice(t: tf.Tensor, n: int):
+    idx = tf.range(0, tf.shape(t)[0])
+    idx = tf.random.shuffle(idx)[:n]
+    return tf.gather(t, idx)
+
+def ccwh_to_xyxy(bboxes):
+    x = bboxes[..., 0]
+    y = bboxes[..., 1]
+    w = bboxes[..., 2]
+    h = bboxes[..., 3]
+    x1 = x - w / 2
+    y1 = y - h / 2
+    x2 = x + w / 2
+    y2 = y + h / 2
+
+    return tf.stack((x1, y1, x2, y2), axis=-1)
+
+def xyxy_to_ccwh(bboxes):
+    x1 = bboxes[..., 0]
+    y1 = bboxes[..., 1]
+    x2 = bboxes[..., 2]
+    y2 = bboxes[..., 3]
+
+    w = x2 - x1
+    h = y2 - y1
+    cx = x1 + w / 2
+    cy = y1 + h / 2
+
+    return tf.stack((cx, cy, w, h), axis=-1)
+
+
+def calculate_offsets(anc: tf.Tensor, gt: tf.Tensor, mean=None, std=None) -> tf.Tensor:
+    x_a, y_a, w_a, h_a = tf.unstack(tf.transpose(anc))
+    x, y, w, h = tf.unstack(tf.transpose(gt))
+
+    t_x = (x - x_a) / w_a
+    t_y = (y - y_a) / h_a
+    t_w = tf.math.log(w / w_a)
+    t_h = tf.math.log(h / h_a)
+
+    offset = tf.stack((t_x, t_y, t_w, t_h), axis=-1)
+
+    if (mean is not None) and (std is not None):
+        offset = (offset - mean) / std
+
+    return offset
+
+
+def apply_offsets(anc: tf.Tensor, offset: tf.Tensor, mean=None, std=None) -> tf.Tensor:
+    x_a, y_a, w_a, h_a = tf.unstack(tf.transpose(anc))
+    t_x, t_y, t_w, t_h = tf.unstack(tf.transpose(offset))
+    x = t_x * w_a + x_a
+    y = t_y * h_a + y_a
+    w = tf.math.exp(t_w) * w_a
+    h = tf.math.exp(t_h) * h_a
+
+    bboxes = tf.stack((x, y, w, h), axis=-1)
+
+    if (mean is not None) and (std is not None):
+        offset = offset * std + mean
+
+    return bboxes
 
 
 def generate_anchor_map(
@@ -115,7 +174,7 @@ def generate_rpn_map(anc_map, anc_valid_mask, gt_bboxes, pos_thresh, neg_thresh)
     anc_bboxes = tf.reshape(anc_map, (-1, 4))
     iou = compute_iou(ccwh_to_xyxy(anc_bboxes), gt_bboxes)
 
-    # iou *= tf.reshape(anc_valid_mask, (-1,))[..., None]  # remove ancs outside bounds
+    iou *= tf.reshape(anc_valid_mask, (-1,))[..., None]  # remove ancs outside bounds
 
     max_iou_per_anc = tf.reduce_max(iou, axis=1)
     best_box_idx_per_anc = tf.argmax(iou, axis=1)
@@ -154,8 +213,8 @@ def select_minibatch(rpn_map, batch_size):
 
     pos_idx = tf_random_choice(tf.where(foreground_mask), tf.cast(batch_size // 2, tf.int64))
     num_pos = tf.shape(pos_idx)[0]
-    # num_neg = tf.maximum(num_pos, 1)
-    num_neg = batch_size - num_pos
+    num_neg = tf.maximum(num_pos, 1)
+    # num_neg = batch_size - num_pos
     neg_idx = tf_random_choice(tf.where(background_mask), num_neg)
 
     batch_cls_mask = tf.scatter_nd(
@@ -173,10 +232,42 @@ def select_minibatch(rpn_map, batch_size):
     return batch_cls_mask, batch_reg_mask
 
 
+def kitti_voc(
+    batch_size: int,
+    img_scale_to: int = 500,
+):
+    (ds_train, ds_val, ds_test), ds_info = tfds.load(
+        "kitti",
+        split=["train", "validation", "test"],
+        shuffle_files=False,
+        with_info=True,
+    )
+
+    ds_train = ds_train.concatenate(ds_val)
+
+    def f(sample):
+        img = tf.cast(sample["image"], tf.float32) / 255.0
+        img_w = tf.cast(tf.shape(img)[0], tf.float32)
+        img_h = tf.cast(tf.shape(img)[1], tf.float32)
+        scaling = img_scale_to / tf.minimum(img_w, img_h)
+
+        img = tf.image.resize(
+            tf.cast(sample["image"], tf.float32) / 255.0,
+            tf.cast((img_w * scaling, img_h * scaling), tf.int32),
+        )
+        bbox = sample["objects"]["bbox"]
+        labels = sample["objects"]["label"]
+        return img, bbox, labels + 1
+
+    ds_train = ds_train.shuffle(5000)
+    ds_train = ds_train.map(f)
+    ds_train = ds_train.batch(1)
+
+    return ds_train, ds_info.features["labels"].names
+
+
 def pascal_voc(
     batch_size: int,
-    anc_ratios: Sequence[float],
-    anc_scales: Sequence[int],
     img_scale_to: int = 500,
 ):
     (ds_train, ds_val, ds_test), ds_info = tfds.load(
@@ -206,7 +297,9 @@ def pascal_voc(
     ds_train = ds_train.map(f)
     ds_train = ds_train.batch(1)
 
-    return ds_train, ds_info.features["labels"].names
+    ds_test = ds_test.map(f)
+    ds_test = ds_test.batch(1)
+    return ds_train, ds_test, ds_info.features["labels"].names
 
 
 def draw_anc_map(img, anc_map, anc_valid_mask):
@@ -241,6 +334,36 @@ def draw_rpn_map(img, anc_map, rpn_map, show_ancs=False):
     return img[0]
 
 
+def vis_single_image(img, model, mapping):
+    proposals, label_pred, pre_offset = model.predict_on_image(img)
+
+    predicted_img = img[None, ...]
+    predicted_img = tf.image.draw_bounding_boxes(
+        predicted_img, proposals[None, ...], ((0, 1, 0),)
+    )
+
+    predicted_img = predicted_img[0].numpy()
+    w, h = predicted_img.shape[:2]
+
+    for box, label in zip(proposals, label_pred):
+        pos = (int(box[1] * h), int(box[0] * w + 16))
+        predicted_img = cv2.putText(
+            predicted_img,
+            mapping[label.numpy()],
+            pos,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 1, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    fig, axs = plt.subplots(1, squeeze=False)
+    axs[0][0].imshow(predicted_img)
+    plt.show()
+
+
+
 def visualize_model_output(ds, model, mapping):
     it = ds.as_numpy_iterator()
     for x in it:
@@ -248,77 +371,48 @@ def visualize_model_output(ds, model, mapping):
         gt_bboxes = x[1][0]
         gt_labels = x[2][0]
 
-        # ancs, anc_valid = generate_anchor_map(img, STRIDE, ANC_SIZES, ANC_RATIOS)
-        # rpn_map = generate_rpn_map(ancs, anc_valid, gt_bboxes, POS_THRESH, NEG_THRESH)
+        proposals, label_pred, pre_offset = model.predict_on_image(img)
 
-        # tf.print(tf.shape(rpn_map))
-        # tf.print(tf.shape(ancs))
-        # tf.print(tf.shape(img))
-        cls_pred, reg_pred, proposals, label_pred, detector_reg = model(img[None, ...])
-        # tf.print(tf.shape(cls_pred))
-        # exit()
-        #     print(tf.shape(batch_cls_mask))
-        #     print(tf.shape(rpn_map))
-        #     print(tf.shape(cls))
-        scores = tf.reduce_max(label_pred, axis=-1)
-        label_pred = tf.argmax(label_pred, axis=-1) - 1
-        mask = label_pred >= 0
-        indices = tf.stack((tf.range(tf.shape(label_pred)[0], dtype=tf.int64), label_pred), axis=-1)
-        detector_reg = tf.gather_nd(detector_reg, indices)
-        print(tf.shape(proposals))
-        print(tf.shape(detector_reg))
-
-        proposals = apply_offsets(xyxy_to_ccwh(proposals), detector_reg)
-        proposals = ccwh_to_xyxy(proposals)
-        proposals = proposals[mask]
-        label_pred = label_pred[mask]
-        scores = scores[mask]
-        scores = tf.ones_like(scores)
-
-        proposals_idx = tf.image.non_max_suppression(proposals, scores, 20)
-        proposals = tf.gather(proposals, proposals_idx)
-
-        # anc_map, anc_valid_mask = generate_anchor_map(img, 16, ANC_SIZES, ANC_RATIOS)
-        # rpn_img = draw_rpn_map(img, anc_map, rpn_map, True)
+        predicted_img = img[None, ...]
+        # predicted_img = tf.image.draw_bounding_boxes(
+        #     predicted_img, gt_bboxes[None, ...], ((1, 0, 0),)
+        # )
         predicted_img = tf.image.draw_bounding_boxes(
-            img[None, ...], proposals[None, ...], ((0, 1, 0),)
-        )[0]
-        predicted_img = tf.image.draw_bounding_boxes(
-            predicted_img[None, ...], gt_bboxes[None, ...], ((1, 0, 0),)
-        )[0]
-        predicted_img = predicted_img.numpy()
+            predicted_img, proposals[None, ...], ((0, 1, 0),)
+        )
+        # predicted_img = tf.image.draw_bounding_boxes(
+        #     predicted_img, pre_offset[None, ...], ((0, 0, 1),)
+        # )
+
+        predicted_img = predicted_img[0].numpy()
         w, h = predicted_img.shape[:2]
-        for box, label in zip(gt_bboxes, gt_labels):
-            pos = (int(box[1] * h), int(box[0] * w))
-            predicted_img = cv2.putText(
-                predicted_img,
-                mapping[label - 1],
-                pos,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (1, 0, 0),
-                3,
-                cv2.LINE_AA,
-            )
+        # for box, label in zip(gt_bboxes, gt_labels):
+        #     pos = (int(box[1] * h), int(box[0] * w + 16))
+        #     predicted_img = cv2.putText(
+        #         predicted_img,
+        #         mapping[label - 1],
+        #         pos,
+        #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         0.5,
+        #         (1, 0, 0),
+        #         2,
+        #         cv2.LINE_AA,
+        #     )
+
         for box, label in zip(proposals, label_pred):
-            pos = (int(box[1] * h), int(box[0] * w))
+            pos = (int(box[1] * h), int(box[0] * w + 16))
             predicted_img = cv2.putText(
                 predicted_img,
                 mapping[label.numpy()],
                 pos,
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 1),
-                3,
+                0.5,
+                (0, 1, 0),
+                2,
                 cv2.LINE_AA,
             )
-        #     # batch_cls_mask, batch_reg_mask = select_minibatch(rpn_map, 256)
-        #     # print(tf.reduce_sum(batch_reg_mask))
-        #     # plt.imshow(tf.cast(tf.reduce_all(valid_anc_mask, axis=-1), tf.float32))
-        #     # plt.imshow(mnist_img)
-        #     # plt.imshow(anc_img)
+
         fig, axs = plt.subplots(1, squeeze=False)
-        # axs[0].imshow(rpn_img)
         axs[0][0].imshow(predicted_img)
         # axs[1][0].imshow(tf.reduce_max(rpn_map[..., 1], axis=-1))
         # axs[1][1].imshow(tf.reduce_sum(cls[0], axis=-1) / 9, vmin=0.0, vmax=1.0)
@@ -346,8 +440,6 @@ def visualize_minibatch(ds):
             img = cv2.putText(
                 img, str(label), pos, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 1), 3, cv2.LINE_AA
             )
-        print(tf.reduce_sum(batch_reg_mask))
-        print(tf.reduce_sum(rpn_map[..., 1]))
         fig, axs = plt.subplots(2)
         axs[0].imshow(img)
         axs[1].imshow(tf.reduce_max(batch_cls_mask, axis=-1))
@@ -572,7 +664,7 @@ class Rpn(tf.keras.Model):
 
     @staticmethod
     def reg_loss(reg_pred, gt_rpn_map, batch_reg_mask):
-        scale_factor = 2
+        scale_factor = 1
         sigma = 3.0  # see: https://github.com/rbgirshick/py-faster-rcnn/issues/89
         sigma_squared = sigma * sigma
         reg_true = gt_rpn_map[..., 2:][batch_reg_mask > 0]
@@ -644,7 +736,7 @@ class DetectionNetwork(tf.keras.Model):
 
     @staticmethod
     def reg_loss(reg_pred, reg_true, labels):
-        scale_factor = 2
+        scale_factor = 1
         mask = tf.argmax(labels, axis=-1) > 0
         sigma = 1.0  # see: https://github.com/rbgirshick/py-faster-rcnn/issues/89
         sigma_squared = sigma * sigma
@@ -691,7 +783,7 @@ class FasterRCNN(tf.keras.Model):
         self.roi_size = roi_size
         self.object_iou_thresh = 0.5
         self.background_iou_thresh = 0.0
-        self.detector_batch_size = 256
+        self.detector_batch_size = 128
 
         self.backbone = self._build_backbone()
         self.rpn = Rpn(batch_size, anc_sizes, anc_ratios)
@@ -729,7 +821,12 @@ class FasterRCNN(tf.keras.Model):
         best_class_label = best_class_label * retain_mask
 
         gt_classes = tf.one_hot(best_class_label, self.num_classes, dtype=tf.float32)
-        offsets = calculate_offsets(xyxy_to_ccwh(proposals), xyxy_to_ccwh(best_class_boxes))
+        offsets = calculate_offsets(
+            xyxy_to_ccwh(proposals),
+            xyxy_to_ccwh(best_class_boxes),
+            DETECTOR_BOX_OFFSET_MEAN,
+            DETECTOR_BOX_OFFSET_STD,
+        )
 
         return proposals, offsets, best_class_boxes, gt_classes
 
@@ -741,8 +838,8 @@ class FasterRCNN(tf.keras.Model):
             tf.reduce_sum(tf.cast(foreground_mask, tf.int64)), self.detector_batch_size // 2
         )
         foreground_idx = tf_random_choice(tf.where(foreground_mask)[:, 0], num_pos)
-        # num_neg = tf.maximum(num_pos, 1)
-        num_neg = self.detector_batch_size - num_pos
+        num_neg = tf.maximum(num_pos, 1)
+        # num_neg = self.detector_batch_size - num_pos
         background_idx = tf_random_choice(tf.where(background_mask)[:, 0], num_neg)
 
         idx = tf.concat((foreground_idx, background_idx), axis=0)
@@ -761,6 +858,40 @@ class FasterRCNN(tf.keras.Model):
         cls_pred, reg_pred, proposals = self.rpn((feats, ancs, anc_valid), training=False)
         label_pred, detector_reg = self.detector((feats, proposals))
         return cls_pred, reg_pred, proposals, label_pred, detector_reg
+
+    def predict_on_image(self, x):
+        feats = self.backbone(x[None, ...])
+        ancs, anc_valid = generate_anchor_map(x, feats[0], self.anc_sizes, self.anc_ratios)
+        cls_pred, reg_pred, proposals = self.rpn((feats, ancs, anc_valid), training=False)
+        label_pred, detector_reg = self.detector((feats, proposals))
+
+        scores = tf.reduce_max(label_pred, axis=-1)
+        label_pred = tf.argmax(label_pred, axis=-1) - 1
+        mask = label_pred >= 0
+        indices = tf.stack((tf.range(tf.shape(label_pred)[0], dtype=tf.int64), label_pred), axis=-1)
+        detector_reg = tf.gather_nd(detector_reg, indices)
+
+        before_offset = proposals
+
+        proposals = apply_offsets(
+            xyxy_to_ccwh(proposals), detector_reg, DETECTOR_BOX_OFFSET_MEAN, DETECTOR_BOX_OFFSET_STD
+        )
+        proposals = ccwh_to_xyxy(proposals)
+        proposals = proposals[mask]
+        label_pred = label_pred[mask]
+        scores = scores[mask]
+        before_offset = before_offset[mask]
+
+        proposals = tf.clip_by_value(proposals, 0.0, 1.0)
+
+        proposals_idx = tf.image.non_max_suppression(
+            proposals, scores, tf.shape(proposals)[0], 0.3, 0.7
+        )
+        proposals = tf.gather(proposals, proposals_idx)
+        label_pred = tf.gather(label_pred, proposals_idx)
+        # before_offset = tf.gather(before_offset, proposals_idx)
+
+        return proposals, label_pred, before_offset
 
     def train_step(self, data):
         img = data[0]
@@ -782,21 +913,21 @@ class FasterRCNN(tf.keras.Model):
 
             proposals = tf.stop_gradient(proposals)
 
-            proposals, offsets, gt_bboxes, gt_labels = self._assign_labels_to_proposals(
+            proposals, gt_offsets, gt_bboxes, gt_labels = self._assign_labels_to_proposals(
                 proposals, gt_bboxes[0], gt_labels[0]
             )
-            proposals, gt_bboxes, gt_labels, offsets = self._select_detector_batch(
-                proposals, gt_bboxes, gt_labels, offsets
+            proposals, gt_bboxes, gt_labels, gt_offsets = self._select_detector_batch(
+                proposals, gt_bboxes, gt_labels, gt_offsets
             )
 
             pred_labels, detector_reg = self.detector((feats, proposals))
             detector_label_loss = DetectionNetwork.cls_loss(gt_labels, pred_labels)
-            detector_reg_loss = DetectionNetwork.reg_loss(detector_reg, offsets, gt_labels)
+            detector_reg_loss = DetectionNetwork.reg_loss(detector_reg, gt_offsets, gt_labels)
 
             loss = rpn_cls_loss + rpn_reg_loss + detector_label_loss + detector_reg_loss
 
         grads = tape.gradient(loss, self.trainable_weights)
-        grads = (tf.clip_by_norm(g, 1) for g in grads)
+        # grads = (tf.clip_by_norm(g, 1) for g in grads)
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
 
         rpn_num_pos = tf.reduce_sum(gt_rpn_map[..., 1][batch_cls_mask > 0])
@@ -826,15 +957,36 @@ class FasterRCNN(tf.keras.Model):
         }
 
 
+def vis_anc_map():
+    feat_size = (32, 32, 512)
+    img = tf.zeros((32 * 16, 32 * 16, 3))
+    feat_map = tf.zeros(feat_size)
+    ancs, anc_valid = generate_anchor_map(img, feat_map, ANC_SIZES, ANC_RATIOS)
+    ancs = ancs[16, 16]
+    ancs = ccwh_to_xyxy(ancs)
+
+    img = tf.image.draw_bounding_boxes(img[None, ...], ancs[None, ...], ((1, 0, 0), ))
+
+    plt.imshow(img[0])
+    plt.show()
+
+
 def main():
+    tf.random.set_seed(1337)
     matplotlib.use("GTK3Agg")  # Or any other X11 back-end
     model = FasterRCNN(BATCH_SIZE, ANC_SIZES, ANC_RATIOS, NUM_CLASSES, ROI_SIZE)
-    ds, label_mapping = pascal_voc(BATCH_SIZE, ANC_RATIOS, ANC_SIZES, IMG_SIZE)
+    ds_train, ds_test, label_mapping = pascal_voc(BATCH_SIZE, IMG_SIZE)
+    # ds, label_mapping = kitti_voc(BATCH_SIZE, IMG_SIZE)
     # canvas = tf.zeros((600, 1000, 3))
     # ds = mnist_dataset(100, 10, canvas, BATCH_SIZE, ANC_RATIOS, ANC_SIZES, 6000)
-    model.load_weights("./test_new_anchors/weights")
-    visualize_model_output(ds, model, label_mapping)
+    model.load_weights("./best_so_far/weights")
+    # visualize_model_output(ds_test, model, label_mapping)
     # visualize_minibatch(ds)
+
+    img = tf.keras.utils.load_img("./kira.jpeg", target_size=(600, 800))
+    img = tf.keras.utils.img_to_array(img) / 255
+    vis_single_image(img, model, label_mapping)
+
 
     callbacks = [
         # tf.keras.callbacks.ReduceLROnPlateau("loss", patience=3),
@@ -845,17 +997,20 @@ def main():
         ),
     ]
 
-    # model.compile(tf.keras.optimizers.Adam(1e-3))
-    model.compile(tf.keras.optimizers.SGD(1e-3, momentum=0.9, weight_decay=WEIGHT_DECAY))
+    model.compile(tf.keras.optimizers.Adam(1e-3))
+    # model.compile(tf.keras.optimizers.SGD(1e-3, momentum=0.9, weight_decay=WEIGHT_DECAY))
     # model.compile(tf.keras.optimizers.SGD(1e-3))
-    model.fit(ds, epochs=10, workers=14, callbacks=callbacks)
-    # model.compile(tf.keras.optimizers.Adam(1e-4))
-    model.compile(tf.keras.optimizers.SGD(1e-4, momentum=0.9, weight_decay=WEIGHT_DECAY))
-    model.fit(ds, epochs=5, workers=14)
-    # model.compile(tf.keras.optimizers.SGD(1e-5, momentum=0.0, weight_decay=0.0005))
+    model.fit(ds_train, epochs=12, workers=14, callbacks=callbacks)
+    model.compile(tf.keras.optimizers.Adam(1e-4))
+    # model.compile(tf.keras.optimizers.SGD(1e-4, momentum=0.9, weight_decay=WEIGHT_DECAY))
+    # model.compile(tf.keras.optimizers.SGD(1e-4))
+    model.fit(ds_train, epochs=5, workers=14)
+    # model.compile(tf.keras.optimizers.SGD(1e-5, momentum=0.9, weight_decay=WEIGHT_DECAY))
     # model.fit(ds, epochs=5, workers=14)
     model.save_weights("./test_new_anchors/weights")
 
 
 if __name__ == "__main__":
+    # vis_anc_map()
+
     main()
