@@ -1,226 +1,189 @@
-from typing import Tuple
-
-import numpy as np
+import tensorflow_datasets as tfds  # type: ignore
 import tensorflow as tf
-import tensorflow_datasets as tfds
 
-from rcnn.util import calculate_iou_array, calculate_offsets, ccwh_to_xyxy, xyxy_to_ccwh
+from typing import Sequence, Optional
 
 
-# ---
-def generate_squares(n: int, size: int, img: np.ndarray):
-    img = np.copy(img)
-    img_w, img_h, _ = img.shape
 
-    x = np.random.randint(0, img_w, size=n)
-    y = np.random.randint(0, img_h, size=n)
-    poses = np.stack((x, y), axis=-1)
-    sizes = np.full((n, 2), size)
+def generate_mnist(mnist_imgs, size: int, img: tf.Tensor) -> tuple:
+    img_w, img_h = tf.shape(img)[0], tf.shape(img)[1]
+    img = tf.convert_to_tensor(img, dtype=tf.float32)
 
-    squares = np.concatenate((poses, sizes), axis=-1)
+    x = tf.random.uniform((tf.shape(mnist_imgs)[0],), 0, img_w - size, dtype=tf.int32)
+    y = tf.random.uniform((tf.shape(mnist_imgs)[0],), 0, img_h - size, dtype=tf.int32)
 
-    colors = np.array(
-        [
-            (1.0, 0.0, 0.0),
-            (1.0, 1.0, 0.0),
-            (0.0, 1.0, 0.0),
-            (0.0, 1.0, 1.0),
-            (0.0, 0.0, 1.0),
-            (1.0, 0.0, 1.0),
-            (1.0, 0.0, 0.0),
-        ]
+    # Initialize an empty bounding boxes tensor
+    bboxes = tf.TensorArray(tf.float32, size=0, dynamic_size=True)
+
+    for i in tf.range(tf.shape(mnist_imgs)[0]):
+        x_pos, y_pos = x[i], y[i]
+        mnist = mnist_imgs[i]
+        if (x_pos + size) < img_w and (y_pos + size) < img_h:
+            mnist_resized = tf.image.resize(mnist, (size, size))
+
+            mask = mnist_resized[..., 0] > 0
+            mask_3d = tf.repeat(mask[..., tf.newaxis], 3, axis=-1)
+            mnist_resized_colored = tf.where(mask_3d, mnist_resized, 0)
+
+            slice_img = img[x_pos : x_pos + size, y_pos : y_pos + size]
+            updated_slice = slice_img * (1 - tf.cast(mask_3d, tf.float32)) + mnist_resized_colored
+
+            # img = img.numpy()  # Convert to numpy for direct slicing
+            # img[x_pos : x_pos + size, y_pos : y_pos + size] = updated_slice
+            # img = tf.convert_to_tensor(img)  # Convert back to tensor
+            # Define a slice within the tensor img
+            # Create a mask of the same shape as img
+            mask = tf.pad(
+                tf.ones((size, size, 3)),
+                [
+                    [x_pos, img.shape[0] - (x_pos + size)],
+                    [y_pos, img.shape[1] - (y_pos + size)],
+                    [0, 0],
+                ],
+            )
+
+            # Inverse of the mask
+            inverse_mask = 1 - mask
+
+            # Multiply the image by the inverse mask to "erase" the portion we want to replace
+            erased_img = img * inverse_mask
+
+            # Multiply the updated slice by the mask to keep only the portion we want
+            padded_updated_slice = (
+                tf.pad(
+                    updated_slice,
+                    [
+                        [x_pos, img.shape[0] - (x_pos + size)],
+                        [y_pos, img.shape[1] - (y_pos + size)],
+                        [0, 0],
+                    ],
+                )
+                * mask
+            )
+
+            # Add the two results together
+            img = erased_img + padded_updated_slice
+
+            bbox = tf.convert_to_tensor(
+                [x_pos, y_pos, x_pos + size, y_pos + size], dtype=tf.float32
+            )
+            bboxes = bboxes.write(i, bbox)
+
+    bboxes_stacked = bboxes.stack()
+
+    # Normalize the bounding boxes
+    shape_tensor = tf.constant([img_w, img_h, img_w, img_h], dtype=tf.float32)
+    bboxes_normalized = bboxes_stacked / shape_tensor
+
+    return img, bboxes_normalized
+
+
+def mnist_dataset(
+    size: int,
+    num_mnist: int,
+    img: tf.Tensor,
+    stride: int,
+    batch_size: int,
+    anc_ratios: Sequence[float],
+    anc_scales: Sequence[int],
+    n: Optional[int] = None,
+):
+    (ds, _), ds_info = tfds.load(
+        "mnist",
+        split=["train", "test"],
+        shuffle_files=True,
+        as_supervised=True,
+        with_info=True,
     )
+    ds = ds.batch(num_mnist)
 
-    bboxes = []
-    for x, y, w, h in squares:
-        if ((x + w) >= img_w) or ((y + h) >= img_h):
-            continue
-        color = colors[np.random.randint(len(colors))]
-        img[x : x + w, y : y + h] = color
-        bboxes.append((x, y, x + w, y + h))
+    def f(x, y):
+        mnist_img, bboxes = generate_mnist(x, size, img)
+        return mnist_img, bboxes, y + 1
 
-    bboxes = np.array(bboxes) / (img_w, img_h, img_w, img_h)
+    # def g(img, bbox, label):
+    #     anc_map, anc_valid_mask = generate_anchor_map(img, stride, anc_scales, anc_ratios)
+    #     rpn_map = generate_rpn_map(anc_map, anc_valid_mask, bbox, POS_THRESH, NEG_THRESH)
+    #     batch_cls_mask, batch_reg_mask = select_minibatch(rpn_map, batch_size)
+    #
+    #     return img, (rpn_map, batch_cls_mask, batch_reg_mask, label)
 
-    return img, bboxes
-
-
-# ---
-def make_batch(img, bboxes, grid_size, ancs, batch_size):
-    anc_mapping, offsets, pos_mask, neg_mask = label_img(bboxes, grid_size, ancs)
-    xy_ancs = ccwh_to_xyxy(ancs)
-    out_of_bounds_mask = np.any(xy_ancs < (0, 0, 0, 0), axis=-1) | np.any(
-        xy_ancs > (1.0, 1.0, 1.0, 1.0), axis=-1
-    )
-    pos_mask &= ~out_of_bounds_mask
-    neg_mask &= ~out_of_bounds_mask
-
-    pos_idx = np.where(pos_mask)[0]
-    neg_idx = np.where(neg_mask)[0]
-
-    num_pos = np.minimum(batch_size / 2, np.sum(pos_mask)).astype(int)
-    num_neg = np.minimum(batch_size - num_pos, np.sum(neg_mask)).astype(int)
-
-    pos_samples = np.random.choice(pos_idx, num_pos, replace=False)
-    neg_samples = np.random.choice(neg_idx, num_neg, replace=False)
-
-    samples = np.concatenate((pos_samples, neg_samples))
-    cls_true = np.concatenate((np.ones_like(pos_samples), np.zeros_like(neg_samples)))
-    reg_true = offsets[pos_samples]
-
-    pos_samples = tf.convert_to_tensor(pos_samples)
-    neg_samples = tf.convert_to_tensor(neg_samples)
-    samples = tf.convert_to_tensor(samples)
-    cls_true = tf.convert_to_tensor(cls_true)
-    reg_true = tf.convert_to_tensor(reg_true)
-
-    return img, pos_samples, neg_samples, samples, cls_true, reg_true
-
-
-# ---
-(ds_train_mnist, ds_test_mnist), ds_info = tfds.load(
-    "mnist",
-    split=["train", "test"],
-    shuffle_files=True,
-    as_supervised=True,
-    with_info=True,
-)
-
-ds_train_mnist = ds_train_mnist.repeat()
-ds_train_it = ds_train_mnist.as_numpy_iterator()
-
-
-def generate_mnist(n: int, size: int, img: np.ndarray):
-    img = np.copy(img)
-    img_w, img_h, _ = img.shape
-
-    x = np.random.randint(0, img_w, size=n)
-    y = np.random.randint(0, img_h, size=n)
-    poses = np.stack((x, y), axis=-1)
-    sizes = np.full((n, 2), size)
-
-    squares = np.concatenate((poses, sizes), axis=-1)
-
-    bboxes = []
-    for x, y, w, h in squares:
-        if ((x + w) >= img_w) or ((y + h) >= img_h):
-            continue
-        mnist, label = next(ds_train_it)
-        mnist = tf.image.resize(mnist, (w, h))
-        rect = img[x : x + w, y : y + h]
-        rect[mnist[..., 0] != 0] = mnist[mnist[..., 0] != 0]
-        img[x : x + w, y : y + h] = rect
-        bboxes.append((x, y, x + w, y + h))
-
-    bboxes = np.array(bboxes) / (img_w, img_h, img_w, img_h)
-
-    return img, bboxes
-
-
-def mnist_generator(n: int, size: int, img: np.ndarray, grid_size, ancs, batch_size):
-    while True:
-        sample, bboxes = generate_mnist(n, size, img)
-        yield make_batch(sample, bboxes, grid_size, ancs, batch_size)
-
-
-def gen_to_dataset(gen, n=None):
-    ds = tf.data.Dataset.from_generator(
-        gen,
-        output_types=(tf.float32, tf.int32, tf.int32, tf.int32, tf.float32, tf.float32),
-        output_shapes=((None, None, 3), (None,), (None,), (None,), (None,), (None, 4)),
-    )
-
+    # ds_train = ds_train.shuffle(5000)
+    ds = ds.map(f)
     if n is not None:
         ds = ds.take(n)
-
+    # ds = ds.map(g)
+    ds = ds.batch(1)
     return ds
 
 
-# ---
 
-def pascal_voc(input_shape, grid_size, ancs, batch_size):
-    (ds_train, ds_test), ds_info = tfds.load(
-        "voc/2007",
-        split=["train", "test"],
-        shuffle_files=True,
+
+
+
+def kitti(
+    img_scale_to: int = 500,
+):
+    (ds_train, ds_val, ds_test), ds_info = tfds.load(
+        "kitti",
+        split=["train", "validation", "test"],
+        shuffle_files=False,
         with_info=True,
     )
 
-    def gen():
-        for sample in ds_train.as_numpy_iterator():
-            img = tf.image.resize(sample["image"] / 255.0, input_shape[:2])
-            bbox = sample["objects"]["bbox"]
-            yield make_batch(img, bbox, grid_size, ancs, batch_size)
+    ds_train = ds_train.concatenate(ds_val)
 
-    return gen_to_dataset(gen)
+    def f(sample):
+        img = tf.cast(sample["image"], tf.float32) / 255.0
+        img_w = tf.cast(tf.shape(img)[0], tf.float32)
+        img_h = tf.cast(tf.shape(img)[1], tf.float32)
+        scaling = img_scale_to / tf.minimum(img_w, img_h)
 
+        img = tf.image.resize(
+            tf.cast(sample["image"], tf.float32) / 255.0,
+            tf.cast((img_w * scaling, img_h * scaling), tf.int32),
+        )
+        bbox = sample["objects"]["bbox"]
+        labels = sample["objects"]["label"]
+        return img, bbox, labels + 1
 
-# ---
-def generate_anchor_boxes(
-    grid_size: Tuple[int, int],
-    base_size: int,
-    aspect_ratios,
-    scales,
-) -> np.ndarray:
-    """
-    Generate anchor boxes for object detection with R-CNN for each cell in a grid.
+    ds_train = ds_train.shuffle(5000)
+    ds_train = ds_train.map(f)
+    ds_train = ds_train.batch(1)
 
-    Args:
-        grid_size (tuple): Number of cells in the grid (rows, columns).
-        base_size (int): The base size of the anchor box (usually the smaller dimension).
-        aspect_ratios (list): List of aspect ratios for generating different box shapes.
-        scales (list): List of scales to multiply the base size by.
-
-    Returns:
-        anchor_boxes (list): List of anchor boxes in the format (x_center, y_center, width, height).
-    """
-    anchor_boxes = []
-    for x in range(grid_size[0]):
-        for y in range(grid_size[1]):
-            for scale in scales:
-                for ratio in aspect_ratios:
-                    width = base_size * scale / grid_size[0]
-                    height = base_size * scale * ratio / grid_size[1]
-                    x_center = (x + 0.5) / grid_size[0]
-                    y_center = (y + 0.5) / grid_size[1]
-
-                    anchor_boxes.append((x_center, y_center, width, height))
-
-    return np.array(anchor_boxes)
+    return ds_train, ds_info.features["labels"].names
 
 
-def label_img(
-    bboxes: np.ndarray,
-    grid_size: Tuple[int, int],
-    ancs: np.ndarray,
-    pos_thresh: float = 0.5,
-    neg_thresh=0.3,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    ancs = ccwh_to_xyxy(ancs)
-    A = ancs.shape[0]
-    B = bboxes.shape[0]
-    anc_mapping = np.full(A, -1, dtype=int)  # (A, ) maps each anchor to a gt bbox
-    iou = calculate_iou_array(ancs, bboxes)  # (A, B)
+def pascal_voc(
+    img_scale_to: int = 500,
+):
+    (ds_train, ds_val, ds_test), ds_info = tfds.load(
+        "voc/2007",
+        split=["train", "validation", "test"],
+        shuffle_files=False,
+        with_info=True,
+    )
 
-    # map each gt bbox to a anchor
-    max_iou_for_gt_idx = np.argmax(iou, axis=0)  # (B, )
-    anc_mapping[max_iou_for_gt_idx] = np.arange(B)
-    pre_mapped_mask = np.zeros(A, dtype=bool)
-    pre_mapped_mask[max_iou_for_gt_idx] = True
+    ds_train = ds_train.concatenate(ds_val)
 
-    # map anc boxes with iou > pos_thesh to gt bbox
-    iou_thresh_mask = np.max(iou, axis=1) > pos_thresh  # (A, )
-    iou_thresh_mask &= ~pre_mapped_mask
-    max_iou_for_anc_idx = np.argmax(iou, axis=1)  # (A, )
-    anc_mapping[iou_thresh_mask] = max_iou_for_anc_idx[iou_thresh_mask]
+    def f(sample):
+        img = tf.cast(sample["image"], tf.float32) / 255.0
+        img_w = tf.cast(tf.shape(img)[0], tf.float32)
+        img_h = tf.cast(tf.shape(img)[1], tf.float32)
+        scaling = img_scale_to / tf.minimum(img_w, img_h)
 
-    pos_mask = pre_mapped_mask | iou_thresh_mask
-    neg_mask = np.max(iou, axis=1) <= neg_thresh
-    neg_mask &= ~pos_mask
+        img = tf.image.resize(
+            tf.cast(sample["image"], tf.float32) / 255.0,
+            tf.cast((img_w * scaling, img_h * scaling), tf.int32),
+        )
+        bbox = sample["objects"]["bbox"]
+        labels = sample["objects"]["label"]
+        return img, bbox, labels + 1
 
-    ancs = xyxy_to_ccwh(ancs)
-    mapped_bboxes = bboxes[anc_mapping]
-    mapped_bboxes = xyxy_to_ccwh(mapped_bboxes)
-    offsets = calculate_offsets(ancs, mapped_bboxes)
-    offsets[~pos_mask] = -1
+    ds_train = ds_train.shuffle(5000)
+    ds_train = ds_train.map(f)
+    ds_train = ds_train.batch(1)
 
-    return anc_mapping, offsets, pos_mask, neg_mask
+    ds_test = ds_test.map(f)
+    ds_test = ds_test.batch(1)
+    return ds_train, ds_test, ds_info.features["labels"].names
