@@ -23,7 +23,7 @@ class FasterRCNN(tf.keras.Model):
         roi_size: int,
         l2: float = 0,
         rpn_foreground_iou_thresh: float = 0.5,
-        rpn_background_iou_thresh: float = 0.0,
+        rpn_background_iou_thresh: float = 0.3,
         detector_foreground_iou_thresh: float = 0.5,
         detector_background_iou_thresh: float = 0.0,
         rpn_batch_size: int = 256,

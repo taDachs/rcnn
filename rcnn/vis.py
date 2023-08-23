@@ -94,7 +94,8 @@ def vis_single_image(img, model, mapping):
         )
 
     fig, axs = plt.subplots(1, squeeze=False)
-    axs[0][0].imshow(predicted_img)
+    plt.axis("off")
+    plt.imshow(predicted_img)
     plt.show()
 
 
