@@ -1,11 +1,11 @@
 import tensorflow_datasets as tfds  # type: ignore
 import tensorflow as tf
 
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Tuple
 
 
 
-def generate_mnist(mnist_imgs, size: int, img: tf.Tensor) -> tuple:
+def generate_mnist(mnist_imgs, size: int, img: tf.Tensor) -> Tuple:
     img_w, img_h = tf.shape(img)[0], tf.shape(img)[1]
     img = tf.convert_to_tensor(img, dtype=tf.float32)
 
@@ -79,15 +79,12 @@ def generate_mnist(mnist_imgs, size: int, img: tf.Tensor) -> tuple:
 
 
 def mnist_dataset(
-    size: int,
+    size_mnist: int,
     num_mnist: int,
-    img: tf.Tensor,
-    stride: int,
-    batch_size: int,
-    anc_ratios: Sequence[float],
-    anc_scales: Sequence[int],
+    img_size: Tuple[int, int],
     n: Optional[int] = None,
 ):
+    img = tf.zeros((*img_size, 3))
     (ds, _), ds_info = tfds.load(
         "mnist",
         split=["train", "test"],
@@ -98,23 +95,15 @@ def mnist_dataset(
     ds = ds.batch(num_mnist)
 
     def f(x, y):
-        mnist_img, bboxes = generate_mnist(x, size, img)
+        mnist_img, bboxes = generate_mnist(x, size_mnist, img)
         return mnist_img, bboxes, y + 1
 
-    # def g(img, bbox, label):
-    #     anc_map, anc_valid_mask = generate_anchor_map(img, stride, anc_scales, anc_ratios)
-    #     rpn_map = generate_rpn_map(anc_map, anc_valid_mask, bbox, POS_THRESH, NEG_THRESH)
-    #     batch_cls_mask, batch_reg_mask = select_minibatch(rpn_map, batch_size)
-    #
-    #     return img, (rpn_map, batch_cls_mask, batch_reg_mask, label)
-
-    # ds_train = ds_train.shuffle(5000)
     ds = ds.map(f)
     if n is not None:
         ds = ds.take(n)
     # ds = ds.map(g)
     ds = ds.batch(1)
-    return ds
+    return ds, ds, ds_info.features["label"].names
 
 
 
@@ -148,7 +137,7 @@ def kitti(
         labels = sample["objects"]["type"]
         return img, bbox, labels + 1
 
-    ds_train = ds_train.shuffle(5000)
+    ds_train = ds_train.shuffle(6000)
     ds_train = ds_train.map(f)
     ds_train = ds_train.batch(1)
 

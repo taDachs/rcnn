@@ -5,7 +5,7 @@ import matplotlib  # type: ignore
 import argparse
 
 from rcnn.faster_rcnn import FasterRCNN
-from rcnn.data import pascal_voc, kitti
+from rcnn.data import pascal_voc, kitti, mnist_dataset
 from rcnn.vis import vis_single_image, visualize_model_output, visualize_dataset
 
 
@@ -14,6 +14,8 @@ def load_dataset(args):
         return pascal_voc(args.img_size)
     elif args.dataset == "kitti":
         return kitti(args.img_size)
+    elif args.dataset == "mnist":
+        return mnist_dataset(100, 10, (args.img_size, args.img_size), 5000)
     else:
         print(f"Invalid dataset name: {args.dataset}")
         exit(1)
@@ -100,7 +102,7 @@ def main():
     common_parser.add_argument("--anc_sizes", type=int, nargs="+", default=(128, 256, 512))
     common_parser.add_argument("--img_size", type=int, default=600)
     common_parser.add_argument("--roi_size", type=int, default=7)
-    common_parser.add_argument("--dataset", type=str, choices=["kitti", "voc"], default="voc")
+    common_parser.add_argument("--dataset", type=str, choices=["kitti", "voc", "mnist"], default="voc")
     common_parser.add_argument(
         "--backbone", type=str, choices=["vgg", "resnet", "mobilenet"], default="vgg"
     )
@@ -116,7 +118,7 @@ def main():
     train_parser.add_argument('--rpn_pos_thresh', type=float, default=0.5)
     train_parser.add_argument('--rpn_neg_thresh', type=float, default=0.3)
     train_parser.add_argument('--detector_pos_thresh', type=float, default=0.5)
-    train_parser.add_argument('--detector_neg_thresh', type=float, default=0.3)
+    train_parser.add_argument('--detector_neg_thresh', type=float, default=0.0)
     train_parser.add_argument("--weight_decay", type=float, default=5e-4)
     train_parser.add_argument("--epochs", type=int, default=12)
     train_parser.add_argument("--workers", type=int, default=14)

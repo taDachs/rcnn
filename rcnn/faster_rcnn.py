@@ -161,6 +161,7 @@ class FasterRCNN(tf.keras.Model):
         num_neg = tf.maximum(num_pos, 1)
         # num_neg = self.rpn_batch_size - num_pos
         neg_idx = tf_random_choice(tf.where(background_mask), num_neg)
+        num_pos = tf.shape(neg_idx)[0]
 
         batch_cls_mask = tf.scatter_nd(
             tf.concat((pos_idx, neg_idx), axis=0),
