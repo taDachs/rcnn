@@ -144,14 +144,18 @@ def kitti(
             tf.cast((img_w * scaling, img_h * scaling), tf.int32),
         )
         bbox = sample["objects"]["bbox"]
-        labels = sample["objects"]["label"]
+        bbox = tf.stack((1 - bbox[..., 2], bbox[..., 1], 1 - bbox[..., 0], bbox[..., 3]), axis=-1)
+        labels = sample["objects"]["type"]
         return img, bbox, labels + 1
 
     ds_train = ds_train.shuffle(5000)
     ds_train = ds_train.map(f)
     ds_train = ds_train.batch(1)
 
-    return ds_train, ds_info.features["labels"].names
+    ds_test = ds_test.map(f)
+    ds_test = ds_test.batch(1)
+
+    return ds_train, ds_test, ds_info.features["objects"]["type"].names
 
 
 def pascal_voc(

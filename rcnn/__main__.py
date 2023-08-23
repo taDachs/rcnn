@@ -6,7 +6,7 @@ import argparse
 
 from rcnn.faster_rcnn import FasterRCNN
 from rcnn.data import pascal_voc, kitti
-from rcnn.vis import vis_single_image, visualize_model_output
+from rcnn.vis import vis_single_image, visualize_model_output, visualize_dataset
 
 
 def load_dataset(args):
@@ -20,10 +20,11 @@ def load_dataset(args):
 
 
 def train(args):
+    ds_train, _, label_mapping = load_dataset(args)
     model = FasterRCNN(
         anc_sizes=args.anc_sizes,
         anc_ratios=args.anc_ratios,
-        num_classes=args.num_classes,
+        num_classes=len(label_mapping) + 1,
         roi_size=args.roi_size,
         l2=args.l2,
         rpn_foreground_iou_thresh=args.rpn_pos_thresh,
@@ -37,8 +38,6 @@ def train(args):
 
     if args.weights_path:
         model.load_weights(args.weights_path)
-
-    ds_train, _, _ = load_dataset(args)
 
     callbacks = [
         tf.keras.callbacks.TerminateOnNaN(),
@@ -61,29 +60,34 @@ def train(args):
 
 
 def eval_on_dataset(args):
+    _, ds_val, label_mapping = load_dataset(args)
     model = FasterRCNN(
         anc_sizes=args.anc_sizes,
         anc_ratios=args.anc_ratios,
-        num_classes=args.num_classes,
+        num_classes=len(label_mapping) + 1,
         roi_size=args.roi_size,
     )
     model.load_weights(args.weights_path)
-    _, ds_val, label_mapping = load_dataset(args)
     visualize_model_output(ds_val, model, label_mapping)
 
 
 def eval_single_image(args):
+    _, _, label_mapping = load_dataset(args)
     model = FasterRCNN(
         anc_sizes=args.anc_sizes,
         anc_ratios=args.anc_ratios,
-        num_classes=args.num_classes,
+        num_classes=len(label_mapping) + 1,
         roi_size=args.roi_size,
     )
-    _, _, label_mapping = load_dataset(args)
     model.load_weights(args.weights_path)
     img = tf.keras.utils.load_img(args.image_path)
     img = tf.keras.utils.img_to_array(img) / 255
     vis_single_image(img, model, label_mapping)
+
+
+def dataset_vis(args):
+    ds, _, label_mapping = load_dataset(args)
+    visualize_dataset(ds, label_mapping)
 
 
 def main():
@@ -95,7 +99,6 @@ def main():
     common_parser.add_argument("--anc_ratios", type=float, nargs="+", default=(0.5, 1.0, 2.0))
     common_parser.add_argument("--anc_sizes", type=int, nargs="+", default=(128, 256, 512))
     common_parser.add_argument("--img_size", type=int, default=600)
-    common_parser.add_argument("--num_classes", type=int, default=21)
     common_parser.add_argument("--roi_size", type=int, default=7)
     common_parser.add_argument("--dataset", type=str, choices=["kitti", "voc"], default="voc")
     common_parser.add_argument(
@@ -107,6 +110,13 @@ def main():
     train_parser.add_argument("--optimizer", type=str, choices=["adam", "sgd"], default="sgd")
     train_parser.add_argument("--lr", type=float, default=1e-3)
     train_parser.add_argument("--momentum", type=float, default=0.9)
+    train_parser.add_argument('--l2', type=float, default=0.5 * 5e-4)
+    train_parser.add_argument('--rpn_batch_size', type=int, default=256)
+    train_parser.add_argument('--detector_batch_size', type=int, default=128)
+    train_parser.add_argument('--rpn_pos_thresh', type=float, default=0.5)
+    train_parser.add_argument('--rpn_neg_thresh', type=float, default=0.3)
+    train_parser.add_argument('--detector_pos_thresh', type=float, default=0.5)
+    train_parser.add_argument('--detector_neg_thresh', type=float, default=0.3)
     train_parser.add_argument("--weight_decay", type=float, default=5e-4)
     train_parser.add_argument("--epochs", type=int, default=12)
     train_parser.add_argument("--workers", type=int, default=14)
@@ -135,6 +145,10 @@ def main():
         "--weights-path", type=str, required=True, help="Path to model weights"
     )
 
+    dataset_vis_parser = subparsers.add_parser(
+        "dataset_vis", parents=[common_parser], help="Visualize labels for dataset"
+    )
+
     args = parser.parse_args()
     tf.random.set_seed(1337)
     matplotlib.use("GTK3Agg")  # Or any other X11 back-end
@@ -145,8 +159,10 @@ def main():
         eval_on_dataset(args)
     elif args.mode == "eval_single_image":
         eval_single_image(args)
+    elif args.mode == "dataset_vis":
+        dataset_vis(args)
     else:
-        print("Please select a valid mode: train, eval, or eval_single_image")
+        print("Please select a valid mode: train, eval, eval_single_image or dataset_vis")
         exit(1)
 
 
