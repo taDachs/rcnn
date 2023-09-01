@@ -128,17 +128,18 @@ class FasterRCNN(tf.keras.Model):
         scores = tf.reduce_max(label_pred, axis=-1)
         label_pred = tf.argmax(label_pred, axis=-1) - 1
         mask = label_pred >= 0
+
+        scores = scores[mask]
+        label_pred = label_pred[mask]
+        before_offset = proposals[mask]
+        proposals = proposals[mask]
+        detector_reg = detector_reg[mask]
+
         indices = tf.stack((tf.range(tf.shape(label_pred)[0], dtype=tf.int64), label_pred), axis=-1)
         detector_reg = tf.gather_nd(detector_reg, indices)
 
-        before_offset = proposals
-
         proposals = apply_offsets(xyxy_to_ccwh(proposals), detector_reg)
         proposals = ccwh_to_xyxy(proposals)
-        proposals = proposals[mask]
-        label_pred = label_pred[mask]
-        scores = scores[mask]
-        before_offset = before_offset[mask]
 
         proposals = tf.clip_by_value(proposals, 0.0, 1.0)
 
@@ -156,7 +157,9 @@ class FasterRCNN(tf.keras.Model):
         background_mask = (rpn_map[..., 1] == 0) & (trainable_mask > 0)
         foreground_mask = (rpn_map[..., 1] == 1) & (trainable_mask > 0)
 
-        pos_idx = tf_random_choice(tf.where(foreground_mask), tf.cast(self.rpn_batch_size // 2, tf.int64))
+        pos_idx = tf_random_choice(
+            tf.where(foreground_mask), tf.cast(self.rpn_batch_size // 2, tf.int64)
+        )
         num_pos = tf.shape(pos_idx)[0]
         num_neg = tf.maximum(num_pos, 1)
         # num_neg = self.rpn_batch_size - num_pos
@@ -169,10 +172,14 @@ class FasterRCNN(tf.keras.Model):
             tf.shape(foreground_mask, tf.int64),
         )
 
-        batch_reg_mask = tf.scatter_nd(
-            pos_idx,
-            tf.ones(num_pos),
-            tf.shape(foreground_mask, tf.int64),
+        batch_reg_mask = tf.cond(
+            num_pos > 0,
+            lambda: tf.scatter_nd(
+                pos_idx,
+                tf.ones(num_pos),
+                tf.shape(foreground_mask, tf.int64),
+            ),
+            lambda: tf.zeros_like(foreground_mask, tf.float32),
         )
 
         return batch_cls_mask, batch_reg_mask
@@ -222,12 +229,8 @@ class FasterRCNN(tf.keras.Model):
 
         rpn_num_pos = tf.reduce_sum(gt_rpn_map[..., 1][batch_cls_mask > 0])
         rpn_num_neg = tf.reduce_sum(1 - gt_rpn_map[..., 1][batch_cls_mask > 0])
-        num_background_rois = tf.reduce_sum(
-            tf.cast(tf.argmax(gt_labels, axis=-1) == 0, tf.float32)
-        )
-        num_foreground_rois = tf.reduce_sum(
-            tf.cast(tf.argmax(gt_labels, axis=-1) > 0, tf.float32)
-        )
+        num_background_rois = tf.reduce_sum(tf.cast(tf.argmax(gt_labels, axis=-1) == 0, tf.float32))
+        num_foreground_rois = tf.reduce_sum(tf.cast(tf.argmax(gt_labels, axis=-1) > 0, tf.float32))
 
         cls_acc = self.cls_accuracy_metric(
             tf.cast(gt_rpn_map[batch_cls_mask > 0][..., 1, None] > 0.5, tf.float32),

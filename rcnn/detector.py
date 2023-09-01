@@ -1,7 +1,6 @@
 import tensorflow as tf
 
 
-
 class DetectionNetwork(tf.keras.Model):
     def __init__(self, roi_size: int, num_classes: int, l2: float, *args, **kwargs):
         super().__init__(*args, **kwargs)
